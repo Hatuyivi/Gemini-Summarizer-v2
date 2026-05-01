@@ -149,9 +149,9 @@ export default function LoginWebViewScreen() {
           javaScriptEnabled
           domStorageEnabled
           thirdPartyCookiesEnabled
-          sharedCookiesEnabled
-          cacheEnabled
-          incognito={false}
+          sharedCookiesEnabled={false}
+          cacheEnabled={false}
+          incognito={true}
           startInLoadingState
           renderLoading={() => (
             <View
