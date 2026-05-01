@@ -4,6 +4,8 @@ export interface AIProvider {
   id: ProviderId;
   name: string;
   loginUrl: string;
+  /** URL to load first so any existing session is cleared before login. */
+  logoutUrl: string;
   chatUrl: string;
   cookieDomains: string[];
   sessionCookieKeys: string[];
@@ -18,6 +20,7 @@ export const PROVIDERS: Record<ProviderId, AIProvider> = {
     id: "chatgpt",
     name: "ChatGPT",
     loginUrl: "https://chatgpt.com/auth/login",
+    logoutUrl: "https://chatgpt.com/auth/logout",
     chatUrl: "https://chatgpt.com/",
     cookieDomains: ["chatgpt.com", ".chatgpt.com", "chat.openai.com"],
     sessionCookieKeys: [
@@ -33,6 +36,7 @@ export const PROVIDERS: Record<ProviderId, AIProvider> = {
     id: "claude",
     name: "Claude",
     loginUrl: "https://claude.ai/login",
+    logoutUrl: "https://claude.ai/logout",
     chatUrl: "https://claude.ai/new",
     cookieDomains: ["claude.ai", ".claude.ai"],
     sessionCookieKeys: ["sessionKey", "lastActiveOrg"],
@@ -48,6 +52,7 @@ export const PROVIDERS: Record<ProviderId, AIProvider> = {
     id: "gemini",
     name: "Gemini",
     loginUrl: "https://gemini.google.com/",
+    logoutUrl: "https://accounts.google.com/Logout?hl=en&continue=https://gemini.google.com/",
     chatUrl: "https://gemini.google.com/app",
     cookieDomains: [
       ".google.com",
@@ -65,6 +70,7 @@ export const PROVIDERS: Record<ProviderId, AIProvider> = {
     id: "perplexity",
     name: "Perplexity",
     loginUrl: "https://www.perplexity.ai/",
+    logoutUrl: "https://www.perplexity.ai/api/auth/signout",
     chatUrl: "https://www.perplexity.ai/",
     cookieDomains: ["perplexity.ai", ".perplexity.ai", "www.perplexity.ai"],
     sessionCookieKeys: ["__Secure-next-auth.session-token", "pplx.session-token"],
