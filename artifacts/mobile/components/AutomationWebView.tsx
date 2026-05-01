@@ -1,4 +1,4 @@
-import { forwardRef, useImperativeHandle, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { Platform, StyleSheet, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 
@@ -134,7 +134,21 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
       }
     }
 
-    return (
+    // Re-inject cookies whenever the prop updates AFTER the WebView is already
+      // loaded. This handles the race where activeCookies resolves from async
+      // storage after the WebView has already fired its loadEnd event.
+      useEffect(() => {
+        if (!ready.current || !webRef.current || !cookies) return;
+        const cookieLines = cookies
+          .split(";")
+          .map((c) => c.trim())
+          .filter(Boolean)
+          .map((c) => `document.cookie = ${JSON.stringify(c + "; path=/;")};`)
+          .join("\n");
+        webRef.current.injectJavaScript(`(function(){try{${cookieLines}}catch(e){} })(); true;`);
+      }, [cookies]);
+
+      return (
       <View style={styles.container} pointerEvents={visible ? "auto" : "none"}>
         <WebView
           ref={(r) => {
