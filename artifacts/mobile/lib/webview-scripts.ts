@@ -272,16 +272,37 @@ export function automationScript(
   }
   function setInputText(el, text){
     if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT'){
-      var setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
-      if (setter && setter.set) setter.set.call(el, text); else el.value = text;
+      // Use the React-compatible native setter so controlled inputs update
+      var nativeInputSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')
+                           || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+      if (nativeInputSetter && nativeInputSetter.set) {
+        nativeInputSetter.set.call(el, text);
+      } else {
+        el.value = text;
+      }
       el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
     } else {
+      // contenteditable — execCommand goes through browser native editing APIs
+      // and properly fires the events that React's synthetic system listens to.
+      // This is the key difference vs direct innerHTML manipulation:
+      // React sees the change and enables the send button.
       el.focus();
-      el.innerHTML = '';
-      var p = document.createElement('p');
-      p.textContent = text;
-      el.appendChild(p);
-      el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+      try {
+        document.execCommand('selectAll', false, null);
+        var ok = document.execCommand('insertText', false, text);
+        if (!ok) throw new Error('execCommand returned false');
+        // Some frameworks (Claude/ProseMirror) also listen for keydown events
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+      } catch(e) {
+        // Fallback for browsers/WebViews that block execCommand
+        el.innerHTML = '';
+        var p = document.createElement('p');
+        p.textContent = text;
+        el.appendChild(p);
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }
     }
   }
   function detectLimit(){
