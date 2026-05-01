@@ -362,7 +362,7 @@ export default function ChatScreen() {
   return (
     <View style={[styles.root, { backgroundColor: colors.background, paddingTop: insets.top }]}>
       {/* Automation WebView for the active account */}
-      {activeAccount && activeCookies ? (
+      {activeAccount && activeCookies !== null ? (
         <View
           style={
             liveView
