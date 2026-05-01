@@ -57,10 +57,9 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Generate release keystore
-        working-directory: .
         run: |
           keytool -genkey -v \
-            -keystore artifacts/mobile/release.jks \
+            -keystore release.jks \
             -alias key0 \
             -keyalg RSA \
             -keysize 2048 \
@@ -69,6 +68,7 @@ jobs:
             -storepass android \
             -keypass android \
             -noprompt
+          echo "Keystore created at: $(pwd)/release.jks"
 
       - name: Expo prebuild (Android)
         env:
@@ -78,7 +78,7 @@ jobs:
 
       - name: Configure release signing in build.gradle
         run: |
-          cp ../release.jks android/app/release.jks
+          cp release.jks android/app/release.jks
           python3 - << 'PYEOF'
           import re
           with open('android/app/build.gradle', 'r') as f:
@@ -97,7 +97,7 @@ jobs:
           content = re.sub(r'(release\s*\{)', r'\1\n                signingConfig signingConfigs.release', content, count=1)
           with open('android/app/build.gradle', 'w') as f:
               f.write(content)
-          print("Signing config injected")
+          print("Signing config injected into build.gradle")
           PYEOF
 
       - name: Cache Gradle dependencies
