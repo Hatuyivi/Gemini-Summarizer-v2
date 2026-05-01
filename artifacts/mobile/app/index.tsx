@@ -283,7 +283,7 @@ export default function ChatScreen() {
   useEffect(() => {
     if (!pendingSend) return;
     if (!activeAccount || activeAccount.id !== pendingSend.forAccountId) return;
-    if (!activeCookies) return;
+    if (activeCookies === null) return;  // null = still loading; empty string = no JS-readable cookies (HttpOnly only)
     // Re-arm the response handler against the same placeholder bubble so
     // the next response/limit/error event updates the correct message.
     pendingAssistantId.current = pendingSend.placeholderId;
