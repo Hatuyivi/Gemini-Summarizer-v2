@@ -48,10 +48,6 @@ Return ONLY a single valid JSON object, no prose, no code fences, with this exac
   "tone": "one short phrase describing the conversational tone (e.g. 'friendly and technical')"
 }`;
 
-      // Pick the AI client. If the mobile client supplied its own Gemini key
-      // via the `x-user-gemini-key` header, talk directly to Google's free-tier
-      // endpoint with that key. Otherwise fall back to Replit's built-in Gemini
-      // integration so the app keeps working out of the box.
       const userKeyHeader = req.header("x-user-gemini-key");
       const userKey =
         typeof userKeyHeader === "string" && userKeyHeader.trim().length > 0
