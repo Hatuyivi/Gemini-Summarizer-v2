@@ -68,7 +68,7 @@ jobs:
             -storepass android \
             -keypass android \
             -noprompt
-          echo "Keystore created at: $(pwd)/release.jks"
+          ls -la release.jks
 
       - name: Expo prebuild (Android)
         env:
@@ -80,10 +80,11 @@ jobs:
         run: |
           cp release.jks android/app/release.jks
           python3 - << 'PYEOF'
-          import re
           with open('android/app/build.gradle', 'r') as f:
               content = f.read()
-          signing_block = """
+
+          # 1. Add signingConfigs block before buildTypes
+          signing_config = """
               signingConfigs {
                   release {
                       storeFile file("release.jks")
@@ -93,11 +94,36 @@ jobs:
                   }
               }
           """
-          content = re.sub(r'(\s*buildTypes\s*\{)', signing_block + r'\1', content, count=1)
-          content = re.sub(r'(release\s*\{)', r'\1\n                signingConfig signingConfigs.release', content, count=1)
+
+          # Find position of "buildTypes" and insert signingConfigs before it
+          bt_idx = content.find('buildTypes')
+          if bt_idx == -1:
+              raise Exception("Could not find 'buildTypes' in build.gradle")
+
+          content = content[:bt_idx] + signing_config + content[bt_idx:]
+
+          # 2. Find "release {" inside buildTypes (now after signingConfigs block)
+          # signingConfigs block ends before buildTypes, so "release {" in buildTypes
+          # is the SECOND occurrence of "release {" in the file
+          first = content.find('release {')
+          second = content.find('release {', first + 1)
+          if second == -1:
+              raise Exception("Could not find second 'release {' (buildTypes.release)")
+
+          insert_at = second + len('release {')
+          line_to_add = '\n            signingConfig signingConfigs.release'
+          content = content[:insert_at] + line_to_add + content[insert_at:]
+
           with open('android/app/build.gradle', 'w') as f:
               f.write(content)
-          print("Signing config injected into build.gradle")
+
+          # Verify
+          with open('android/app/build.gradle', 'r') as f:
+              lines = f.readlines()
+          print("Signing-related lines in build.gradle:")
+          for i, line in enumerate(lines, 1):
+              if any(kw in line for kw in ['signingConfig', 'storeFile', 'keyAlias', 'release {']):
+                  print(f"  {i}: {line}", end='')
           PYEOF
 
       - name: Cache Gradle dependencies
@@ -119,8 +145,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.1.12297006
         run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Locate APK
-        id: apk
+      - name: Locate and upload APK
         run: |
           APK_PATH=$(find android/app/build/outputs/apk/release -name "*.apk" -print -quit)
           if [ -z "$APK_PATH" ]; then
@@ -128,12 +153,12 @@ jobs:
             exit 1
           fi
           echo "Found APK at $APK_PATH"
-          echo "apk_path=artifacts/mobile/$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "apk_path=artifacts/mobile/$APK_PATH" >> "$GITHUB_ENV"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ai-hub-manager-android-${{ github.sha }}
-          path: ${{ steps.apk.outputs.apk_path }}
+          path: ${{ env.apk_path }}
           if-no-files-found: error
           retention-days: 30
