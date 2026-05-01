@@ -47,6 +47,13 @@ jobs:
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
           restore-keys: pnpm-${{ runner.os }}-
 
+      # pnpm by default isolates packages per workspace. React Native/Metro
+      # needs babel-preset-expo and other packages to be resolvable from the
+      # project root. shamefully-hoist=true flattens node_modules like npm/yarn.
+      - name: Configure pnpm hoisting for React Native Metro
+        working-directory: .
+        run: echo "shamefully-hoist=true" >> .npmrc
+
       - name: Accept Android SDK licenses & install NDK 27
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
@@ -83,8 +90,7 @@ jobs:
           with open('android/app/build.gradle', 'r') as f:
               content = f.read()
 
-          # 1. Add signingConfigs block before buildTypes
-          signing_config = """
+          signing_block = """
               signingConfigs {
                   release {
                       storeFile file("release.jks")
@@ -95,35 +101,27 @@ jobs:
               }
           """
 
-          # Find position of "buildTypes" and insert signingConfigs before it
           bt_idx = content.find('buildTypes')
           if bt_idx == -1:
               raise Exception("Could not find 'buildTypes' in build.gradle")
+          content = content[:bt_idx] + signing_block + content[bt_idx:]
 
-          content = content[:bt_idx] + signing_config + content[bt_idx:]
-
-          # 2. Find "release {" inside buildTypes (now after signingConfigs block)
-          # signingConfigs block ends before buildTypes, so "release {" in buildTypes
-          # is the SECOND occurrence of "release {" in the file
           first = content.find('release {')
           second = content.find('release {', first + 1)
           if second == -1:
               raise Exception("Could not find second 'release {' (buildTypes.release)")
 
           insert_at = second + len('release {')
-          line_to_add = '\n            signingConfig signingConfigs.release'
-          content = content[:insert_at] + line_to_add + content[insert_at:]
+          content = content[:insert_at] + '\n            signingConfig signingConfigs.release' + content[insert_at:]
 
           with open('android/app/build.gradle', 'w') as f:
               f.write(content)
 
-          # Verify
+          print("Signing config injected")
           with open('android/app/build.gradle', 'r') as f:
-              lines = f.readlines()
-          print("Signing-related lines in build.gradle:")
-          for i, line in enumerate(lines, 1):
-              if any(kw in line for kw in ['signingConfig', 'storeFile', 'keyAlias', 'release {']):
-                  print(f"  {i}: {line}", end='')
+              for i, line in enumerate(f.readlines(), 1):
+                  if 'signingConfig' in line or 'storeFile' in line:
+                      print(f"  L{i}: {line.rstrip()}")
           PYEOF
 
       - name: Cache Gradle dependencies
