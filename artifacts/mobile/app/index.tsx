@@ -362,7 +362,7 @@ export default function ChatScreen() {
   return (
     <View style={[styles.root, { backgroundColor: colors.background, paddingTop: insets.top }]}>
       {/* Automation WebView for the active account */}
-      {activeAccount && activeCookies !== null ? (
+      {activeAccount ? (
         <View
           style={
             liveView
@@ -382,7 +382,7 @@ export default function ChatScreen() {
             key={activeAccount.id}
             ref={automationRef}
             provider={getResolvedProvider(activeAccount.providerId)}
-            cookies={activeCookies}
+            cookies={activeCookies ?? ""}
             onEvent={handleAutomationEvent}
             visible={liveView}
             resumeUrl={chatUrls[activeAccount.id] ?? null}
