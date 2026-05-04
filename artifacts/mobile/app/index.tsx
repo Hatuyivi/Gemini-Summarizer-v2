@@ -51,6 +51,7 @@ export default function ChatScreen() {
     chatUrls,
     setChatUrl,
     consumePendingContextSeed,
+    pendingContextSeed,
   } = useApp();
 
   const [input, setInput] = useState("");
@@ -61,6 +62,10 @@ export default function ChatScreen() {
   } | null>(null);
   const [activeCookies, setActiveCookies] = useState<string | null>(null);
   const [liveView, setLiveView] = useState(false);
+  const [handoffDebug, setHandoffDebug] = useState<{
+    label: "queued" | "injected";
+    at: number;
+  } | null>(null);
   const automationRef = useRef<AutomationHandle | null>(null);
   const pendingAssistantId = useRef<string | null>(null);
   const pendingFallbackPrompt = useRef<string | null>(null);
@@ -93,6 +98,10 @@ export default function ChatScreen() {
       setActiveCookies(null);
       return;
     }
+    // Immediately clear previous-account cookies on account switch.
+    // Without this, the remounted WebView can briefly boot with stale
+    // cookies from the old account while the new cookies are still loading.
+    setActiveCookies(null);
     let cancelled = false;
     (async () => {
       const c = await storage.loadCookies(id);
@@ -185,6 +194,18 @@ export default function ChatScreen() {
     [activeAccount, updateMessage, setAssistantTyping],
   );
 
+  useEffect(() => {
+    if (!activeAccount || !pendingContextSeed) return;
+    if (pendingContextSeed.accountId !== activeAccount.id) return;
+    setHandoffDebug({ label: "queued", at: Date.now() });
+  }, [activeAccount?.id, pendingContextSeed]);
+
+  useEffect(() => {
+    if (!handoffDebug) return;
+    const t = setTimeout(() => setHandoffDebug(null), 12000);
+    return () => clearTimeout(t);
+  }, [handoffDebug]);
+
   const sendPrompt = useCallback(
     async (prompt: string, imageDataUrl: string | null) => {
       if (!activeAccount) return;
@@ -255,6 +276,9 @@ export default function ChatScreen() {
       // Subsequent messages on the same account go straight through —
       // the bot is already in the running conversation.
       const seed = consumePendingContextSeed(activeAccount.id);
+      if (seed) {
+        setHandoffDebug({ label: "injected", at: Date.now() });
+      }
       const ctx = seed
         ? `Context from my previous conversation with another assistant:\n${seed}\n\n---\n\n${prompt}`
         : prompt;
@@ -293,6 +317,9 @@ export default function ChatScreen() {
     // Same context-seed logic as the normal send path: if the auto-rotation
     // produced a handoff summary for this new account, prepend it once.
     const seed = consumePendingContextSeed(activeAccount.id);
+    if (seed) {
+      setHandoffDebug({ label: "injected", at: Date.now() });
+    }
     const ctx = seed
       ? `Context from my previous conversation with another assistant:\n${seed}\n\n---\n\n${pendingSend.prompt}`
       : pendingSend.prompt;
@@ -493,6 +520,15 @@ export default function ChatScreen() {
           <Feather name="more-horizontal" size={20} color={colors.foreground} />
         </Pressable>
       </View>
+      {handoffDebug ? (
+        <View style={[styles.handoffDebugWrap, { borderBottomColor: colors.border }]}>
+          <Text style={[styles.handoffDebugText, { color: colors.mutedForeground }]}>
+            {handoffDebug.label === "queued"
+              ? `Handoff queued (${Math.max(0, Math.floor((Date.now() - handoffDebug.at) / 1000))}s ago)`
+              : `Handoff injected (${Math.max(0, Math.floor((Date.now() - handoffDebug.at) / 1000))}s ago)`}
+          </Text>
+        </View>
+      ) : null}
 
       <KeyboardAvoidingView
         behavior="padding"
@@ -707,6 +743,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderBottomWidth: StyleSheet.hairlineWidth,
     gap: 10,
+  },
+  handoffDebugWrap: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  handoffDebugText: {
+    fontFamily: "Inter_400Regular",
+    fontSize: 11,
   },
   iconBtn: {
     width: 36,

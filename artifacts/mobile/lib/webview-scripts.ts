@@ -104,10 +104,13 @@ export function selectorPickerScript(): string {
       while ((sib = sib.previousElementSibling)) {
         if (sib.nodeName.toLowerCase() === sel) nth++;
       }
-      var cls = (el.getAttribute('class') || '').trim().split(/\\s+/).filter(function(c){
-        return c && !/^[a-z]+-[a-z0-9]+$/i.test(c) && c.length < 30;
-      }).slice(0,2);
-      if (cls.length) sel += '.' + cls.join('.');
+      // Avoid class names in generated selectors: utility/hash classes are
+      // frequently unstable and may contain CSS-special chars (":" "/" "[" "]")
+      // that break querySelector unless escaped.
+      var dataTestId = el.getAttribute('data-testid');
+      if (dataTestId && dataTestId.length < 60) {
+        sel += '[data-testid="' + dataTestId.replace(/"/g,'\\\\"') + '"]';
+      }
       var role = el.getAttribute('role');
       if (role) sel += '[role="' + role + '"]';
       var aria = el.getAttribute('aria-label');
@@ -231,6 +234,7 @@ export function automationScript(
   imageDataUrl?: string | null,
 ): string {
   const safePrompt = escape(prompt);
+  const providerId = JSON.stringify(provider.id);
   const inputSel = JSON.stringify(provider.inputSelector);
   const sendSel = JSON.stringify(provider.sendButtonSelector);
   const respSel = JSON.stringify(provider.responseSelector);
@@ -245,7 +249,12 @@ export function automationScript(
   function findInput(){
     var sels = ${inputSel}.split(',');
     for (var i=0;i<sels.length;i++){
-      var el = document.querySelector(sels[i].trim());
+      var el = null;
+      try {
+        el = document.querySelector(sels[i].trim());
+      } catch(e) {
+        continue;
+      }
       if (el) return el;
     }
     return null;
@@ -253,7 +262,12 @@ export function automationScript(
   function findSend(){
     var sels = ${sendSel}.split(',');
     for (var i=0;i<sels.length;i++){
-      var el = document.querySelector(sels[i].trim());
+      var el = null;
+      try {
+        el = document.querySelector(sels[i].trim());
+      } catch(e) {
+        continue;
+      }
       if (el) return el;
     }
     return null;
@@ -261,11 +275,33 @@ export function automationScript(
   function allResponseNodes(){
     var sels = ${respSel}.split(',');
     var nodes = [];
+    var seen = new Set();
     for (var i=0;i<sels.length;i++){
-      var n = document.querySelectorAll(sels[i].trim());
+      var n = null;
+      try {
+        n = document.querySelectorAll(sels[i].trim());
+      } catch(e) {
+        continue;
+      }
       for (var j=0;j<n.length;j++) nodes.push(n[j]);
     }
-    return nodes;
+    // Claude occasionally shifts DOM wrappers; add a resilient fallback
+    // for visible assistant markdown blocks when selector matches are sparse.
+    if (nodes.length < 1 && ${providerId} === "claude"){
+      var fb = document.querySelectorAll(
+        "main article .prose, main .font-claude-message, main [data-is-streaming='true'], main [data-testid*='assistant']",
+      );
+      for (var k=0;k<fb.length;k++) nodes.push(fb[k]);
+    }
+    // Deduplicate nodes collected from multiple selectors.
+    var uniq = [];
+    for (var u=0;u<nodes.length;u++){
+      var key = nodes[u];
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniq.push(nodes[u]);
+    }
+    return uniq;
   }
   function nodeText(el){
     return (el && (el.innerText || el.textContent)) || '';

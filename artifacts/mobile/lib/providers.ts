@@ -43,9 +43,9 @@ export const PROVIDERS: Record<ProviderId, AIProvider> = {
     inputSelector:
       "div.ProseMirror[contenteditable='true'], div[contenteditable='true'][role='textbox'], div[contenteditable='true'][data-placeholder], fieldset div[contenteditable='true']",
     sendButtonSelector:
-      "button[aria-label*='Send'], button[aria-label*='send'], button[type='submit']:has(svg), fieldset button:has(svg[data-icon='paper-airplane'])",
+      "button[aria-label*='Send'], button[aria-label*='send'], button[type='submit'], form button[type='submit'], fieldset button[type='submit']",
     responseSelector:
-      "div.font-claude-message, div[data-is-streaming], div[data-testid='message'], div.prose",
+      "main article .font-claude-message, main article .prose, main [data-is-streaming='true'], main [data-testid*='assistant'], div.font-claude-message, div[data-testid='message']",
     estimatedDailyMessages: 30,
   },
   gemini: {

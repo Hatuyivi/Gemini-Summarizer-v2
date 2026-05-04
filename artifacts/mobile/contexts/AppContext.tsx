@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import { storage, newId } from "@/lib/storage";
 import {
@@ -131,6 +131,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [pendingContextSeed, setPendingContextSeed] = useState<
     { accountId: string; text: string } | null
   >(null);
+  const pendingContextSeedRef = useRef<{
+    accountId: string;
+    text: string;
+  } | null>(null);
   const [geminiKeys, setGeminiKeys] = useState<GeminiApiKey[]>([]);
   const [activeGeminiKeyId, setActiveGeminiKeyId] = useState<string | null>(
     null,
@@ -318,6 +322,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
       },
       async setActiveAccount(id) {
+        if (id !== null && !accounts.some((a) => a.id === id)) return;
         if (!id || id === activeId) {
           setActiveId(id);
           return;
@@ -346,7 +351,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           //    account always has context, even if the user sends a
           //    message before the async summary finishes.
           const rawSeed = buildHandoffSeed(userAssistantMsgs, oldSummary);
-          setPendingContextSeed({ accountId: id, text: rawSeed });
+          const seed = { accountId: id, text: rawSeed };
+          pendingContextSeedRef.current = seed;
+          setPendingContextSeed(seed);
           // 2. Kick off summarization in the background. If the seed
           //    has not been consumed yet, upgrade it to the compact
           //    summary; either way, persist the summary in history.
@@ -366,7 +373,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               });
               setPendingContextSeed((prev) => {
                 if (prev && prev.accountId === id) {
-                  return { accountId: id, text: result.summary };
+                  const nextSeed = { accountId: id, text: result.summary };
+                  pendingContextSeedRef.current = nextSeed;
+                  return nextSeed;
                 }
                 return prev;
               });
@@ -377,6 +386,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             });
         }
         setActiveId(id);
+        // Persist selection immediately so a fast screen transition/app pause
+        // cannot leave storage with the previously active account.
+        await storage.saveActiveAccountId(id);
       },
       chatUrls,
       setChatUrl(accountId, url) {
@@ -395,10 +407,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       },
       pendingContextSeed,
       consumePendingContextSeed(accountId) {
-        if (!pendingContextSeed || pendingContextSeed.accountId !== accountId) {
+        const seed = pendingContextSeedRef.current;
+        if (!seed || seed.accountId !== accountId) {
           return null;
         }
-        const text = pendingContextSeed.text;
+        const text = seed.text;
+        pendingContextSeedRef.current = null;
         setPendingContextSeed(null);
         return text;
       },
@@ -514,7 +528,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             // always has context, even if the auto-rotation pendingSend
             // fires before summarization finishes.
             const rawSeed = buildHandoffSeed(userAssistantMsgs, summary);
-            setPendingContextSeed({ accountId: next.id, text: rawSeed });
+            const seed = { accountId: next.id, text: rawSeed };
+            pendingContextSeedRef.current = seed;
+            setPendingContextSeed(seed);
             void summarizeMessages(userAssistantMsgs, summary, summarizeOpts)
               .then((result) => {
                 setSummary(result);
@@ -530,7 +546,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 });
                 setPendingContextSeed((prev) => {
                   if (prev && prev.accountId === next.id) {
-                    return { accountId: next.id, text: result.summary };
+                    const nextSeed = {
+                      accountId: next.id,
+                      text: result.summary,
+                    };
+                    pendingContextSeedRef.current = nextSeed;
+                    return nextSeed;
                   }
                   return prev;
                 });

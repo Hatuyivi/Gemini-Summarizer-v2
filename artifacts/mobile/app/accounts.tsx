@@ -88,9 +88,9 @@ export default function AccountsScreen() {
           <AccountCard
             account={item}
             isActive={activeAccount?.id === item.id}
-            onSelect={() => {
+            onSelect={async () => {
               void Haptics.selectionAsync();
-              void setActiveAccount(item.id);
+              await setActiveAccount(item.id);
               router.back();
             }}
             onRemove={() => confirmRemove(item.id, item.email)}
