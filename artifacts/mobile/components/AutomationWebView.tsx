@@ -18,6 +18,12 @@ export interface AutomationHandle {
 
 interface Props {
   provider: AIProvider;
+  /**
+   * Stable per-device account id. MUST NOT depend on the cookie string:
+   * cookies load async / can be re-serialized — using them in WebView `key`
+   * remounts the WebView and reloads `claude.ai/new` after every message.
+   */
+  sessionKey: string;
   cookies: string;
   onEvent: (e: AutomationEvent) => void;
   visible?: boolean;
@@ -38,7 +44,7 @@ interface Props {
 /** Hidden WebView that drives an authenticated AI service. */
 export const AutomationWebView = forwardRef<AutomationHandle, Props>(
   function AutomationWebView(
-    { provider, cookies, onEvent, visible, resumeUrl, onUrlChange },
+    { provider, sessionKey, cookies, onEvent, visible, resumeUrl, onUrlChange },
     ref,
   ) {
     // Snapshot the source URL at mount so navigation inside the WebView
@@ -48,33 +54,29 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     const sendQueue = useRef<{ prompt: string; image?: string | null }[]>([]);
     const ready = useRef(false);
 
-    // When the account switches (provider or cookies identity changes) we
-    // need to reset the ready flag so queued sends are not fired against a
-    // stale document. The WebView itself is remounted via its `key` prop
-    // (derived from provider.id + a slice of the cookie string) so the
-    // source URL ref also needs to be updated to the new account's URL.
+    // Remount WebView only when the logical session changes (account or
+    // provider) — never when the cookie *string* updates, or Claude reloads
+    // `…/new` and starts a fresh thread after every send on Android.
     const prevProviderIdRef = useRef(provider.id);
-    const prevCookieKeyRef = useRef(cookies.slice(0, 32));
+    const prevSessionKeyRef = useRef(sessionKey);
     useEffect(() => {
       const newProvId = provider.id;
-      const newCookieKey = cookies.slice(0, 32);
       if (
         newProvId !== prevProviderIdRef.current ||
-        newCookieKey !== prevCookieKeyRef.current
+        sessionKey !== prevSessionKeyRef.current
       ) {
-        // Account changed — reset state so the remounted WebView starts clean.
         prevProviderIdRef.current = newProvId;
-        prevCookieKeyRef.current = newCookieKey;
+        prevSessionKeyRef.current = sessionKey;
         ready.current = false;
         sendQueue.current = [];
         sourceUriRef.current = resumeUrl || provider.chatUrl;
       }
-    }, [provider, cookies, resumeUrl]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- resumeUrl/chatUrl
+      // are read intentionally only when sessionKey/provider.id change; adding
+      // resumeUrl would re-run on every Claude navigation and fight in-page URL.
+    }, [provider.id, sessionKey]);
 
-    // A stable key that changes only when the active account changes. This
-    // forces a full WebView remount (new cookie store context) so that
-    // switching accounts never leaks the previous session into the new one.
-    const webViewKey = `${provider.id}:${cookies.slice(0, 32)}`;
+    const webViewKey = `${provider.id}:${sessionKey}`;
 
     useImperativeHandle(ref, () => ({
       async send(prompt: string, imageDataUrl?: string | null) {

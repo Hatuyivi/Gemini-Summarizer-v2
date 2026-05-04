@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { storage, newId } from "@/lib/storage";
 import {
@@ -141,7 +149,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
   const [summaryBlocks, setSummaryBlocks] = useState<SummaryBlock[]>([]);
 
+  /** Always in sync before paint — avoids stale closures in context callbacks. */
+  const accountsRef = useRef<AIAccount[]>([]);
+  const activeIdRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    accountsRef.current = accounts;
+    activeIdRef.current = activeId;
+  }, [accounts, activeId]);
+
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       const [a, id, m, s, sel, urls, keys, activeKeyId, blocks] =
         await Promise.all([
@@ -155,6 +172,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           storage.loadActiveGeminiKeyId(),
           storage.loadSummaryBlocks(),
         ]);
+      if (cancelled) return;
+
       setSelectors(sel);
       setChatUrls(urls);
       setGeminiKeys(keys);
@@ -172,12 +191,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           ? acc
           : { ...acc, messagesUsedToday: 0, lastResetDate: todayKey(), status: acc.status === "limit" ? "active" : acc.status },
       );
+      const validIds = new Set(refreshed.map((acc) => acc.id));
+      let resolvedActive = id;
+      if (resolvedActive && !validIds.has(resolvedActive)) {
+        resolvedActive = null;
+      }
+      if (!resolvedActive) {
+        resolvedActive = refreshed[0]?.id ?? null;
+      }
+
       setAccounts(refreshed);
-      setActiveId(id ?? refreshed[0]?.id ?? null);
+      setActiveId((current) => {
+        if (current && validIds.has(current)) {
+          activeIdRef.current = current;
+          return current;
+        }
+        activeIdRef.current = resolvedActive;
+        return resolvedActive;
+      });
       setMessages(m);
       setSummary(s);
       setReady(true);
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -322,9 +360,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
       },
       async setActiveAccount(id) {
-        if (id !== null && !accounts.some((a) => a.id === id)) return;
-        if (!id || id === activeId) {
+        const list = accountsRef.current;
+        if (id !== null && !list.some((a) => a.id === id)) return;
+        if (!id) {
+          setActiveId(null);
+          activeIdRef.current = null;
+          await storage.saveActiveAccountId(null);
+          return;
+        }
+        if (id === activeIdRef.current) {
           setActiveId(id);
+          await storage.saveActiveAccountId(id);
           return;
         }
         // Switching to a different account:
@@ -386,6 +432,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             });
         }
         setActiveId(id);
+        activeIdRef.current = id;
         // Persist selection immediately so a fast screen transition/app pause
         // cannot leave storage with the previously active account.
         await storage.saveActiveAccountId(id);
@@ -432,18 +479,25 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         };
         await storage.saveCookies(acc.id, cookies);
         setAccounts((prev) => [...prev, acc]);
-        if (!activeId) setActiveId(acc.id);
+        if (!activeIdRef.current) {
+          setActiveId(acc.id);
+          activeIdRef.current = acc.id;
+        }
         return acc;
       },
       async removeAccount(id) {
         await storage.deleteCookies(id);
-        setAccounts((prev) => prev.filter((a) => a.id !== id));
-        if (activeId === id) {
-          setActiveId((prev) => {
-            const remaining = accounts.filter((a) => a.id !== id);
-            return remaining[0]?.id ?? null;
-          });
-        }
+        setAccounts((prev) => {
+          const next = prev.filter((a) => a.id !== id);
+          accountsRef.current = next;
+          return next;
+        });
+        setActiveId((cur) => {
+          if (cur !== id) return cur;
+          const na = accountsRef.current[0]?.id ?? null;
+          activeIdRef.current = na;
+          return na;
+        });
       },
       async markAccountStatus(id, status, resetAtMs) {
         setAccounts((prev) =>
@@ -562,6 +616,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               });
           }
           setActiveId(next.id);
+          activeIdRef.current = next.id;
         }
         return next;
       },

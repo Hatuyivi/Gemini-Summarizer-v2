@@ -287,5 +287,6 @@ export const storage = {
 };
 
 export function newId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
+  const part = () => Math.random().toString(36).slice(2, 11);
+  return `${Date.now().toString(36)}_${part()}_${part()}`;
 }

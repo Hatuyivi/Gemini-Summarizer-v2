@@ -408,6 +408,7 @@ export default function ChatScreen() {
           <AutomationWebView
             key={activeAccount.id}
             ref={automationRef}
+            sessionKey={activeAccount.id}
             provider={getResolvedProvider(activeAccount.providerId)}
             cookies={activeCookies ?? ""}
             onEvent={handleAutomationEvent}
