@@ -32,11 +32,23 @@ import { Feather } from "@expo/vector-icons";
     /**
      * Two-phase load: first navigate to the provider's logout URL so any
      * existing browser session is cleared, then load the actual login page.
-     * This ensures the user is always presented with a fresh login form when
-     * adding a new account, even if another account was previously logged in.
+     *
+     * We use `incognito={true}` on the WebView so the login flow runs in a
+     * completely isolated cookie store — separate from both the OS shared
+     * cookie store AND any other AutomationWebView instances. Without this,
+     * iOS reuses the shared WKWebView data store and the user sees the
+     * session of the account that was already active instead of a fresh
+     * login form.
+     *
+     * After successful login we extract the cookies via JS injection and
+     * persist them ourselves via storage.saveCookies(), so incognito mode
+     * does not lose the session.
      */
     const [phase, setPhase] = useState<"logout" | "login">("logout");
     const webRef = useRef<WebView | null>(null);
+    // Guard: only transition from logout→login once, even if onLoadEnd fires
+    // multiple times (redirect chains can fire it more than once).
+    const logoutLoadedRef = useRef(false);
 
     useEffect(() => {
       if (!provider) {
@@ -65,8 +77,11 @@ import { Feather } from "@expo/vector-icons";
     }
 
     function handleLoadEnd() {
-      if (phase === "logout") {
-        // Logout page has finished — now navigate to the actual login URL.
+      if (phase === "logout" && !logoutLoadedRef.current) {
+        logoutLoadedRef.current = true;
+        // Logout page has fully loaded — now switch to the login URL.
+        // key={phase} on the WebView forces a full remount so the
+        // incognito session is completely fresh for the login URL.
         setPhase("login");
       }
     }
@@ -166,7 +181,9 @@ import { Feather } from "@expo/vector-icons";
             ref={(r) => {
               webRef.current = r;
             }}
-            key={sourceUri}
+            // key forces a full WebView remount when phase changes so the
+            // incognito session starts completely fresh for the login URL.
+            key={phase}
             source={{ uri: sourceUri }}
             injectedJavaScriptBeforeContentLoaded={
               phase === "login" ? loginObserverScript(provider) : undefined
@@ -176,9 +193,16 @@ import { Feather } from "@expo/vector-icons";
             javaScriptEnabled
             domStorageEnabled
             thirdPartyCookiesEnabled
-            sharedCookiesEnabled
-            cacheEnabled
-            incognito={false}
+            // CRITICAL FIX: incognito=true gives this WebView its own isolated
+            // cookie/storage context. Without this, iOS shares the WKWebView
+            // data store across ALL WebView instances in the app — the active
+            // AutomationWebView session leaks in and the user sees the already-
+            // logged-in account instead of a fresh login form.
+            incognito={true}
+            // sharedCookiesEnabled is mutually exclusive with incognito on iOS.
+            sharedCookiesEnabled={false}
+            // Disable cache so the logout page is always fetched fresh.
+            cacheEnabled={false}
             startInLoadingState
             renderLoading={() => (
               <View
@@ -331,4 +355,3 @@ import { Feather } from "@expo/vector-icons";
       flex: 1,
     },
   });
-  
