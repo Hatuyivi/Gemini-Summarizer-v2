@@ -48,6 +48,34 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     const sendQueue = useRef<{ prompt: string; image?: string | null }[]>([]);
     const ready = useRef(false);
 
+    // When the account switches (provider or cookies identity changes) we
+    // need to reset the ready flag so queued sends are not fired against a
+    // stale document. The WebView itself is remounted via its `key` prop
+    // (derived from provider.id + a slice of the cookie string) so the
+    // source URL ref also needs to be updated to the new account's URL.
+    const prevProviderIdRef = useRef(provider.id);
+    const prevCookieKeyRef = useRef(cookies.slice(0, 32));
+    useEffect(() => {
+      const newProvId = provider.id;
+      const newCookieKey = cookies.slice(0, 32);
+      if (
+        newProvId !== prevProviderIdRef.current ||
+        newCookieKey !== prevCookieKeyRef.current
+      ) {
+        // Account changed — reset state so the remounted WebView starts clean.
+        prevProviderIdRef.current = newProvId;
+        prevCookieKeyRef.current = newCookieKey;
+        ready.current = false;
+        sendQueue.current = [];
+        sourceUriRef.current = resumeUrl || provider.chatUrl;
+      }
+    }, [provider, cookies, resumeUrl]);
+
+    // A stable key that changes only when the active account changes. This
+    // forces a full WebView remount (new cookie store context) so that
+    // switching accounts never leaks the previous session into the new one.
+    const webViewKey = `${provider.id}:${cookies.slice(0, 32)}`;
+
     useImperativeHandle(ref, () => ({
       async send(prompt: string, imageDataUrl?: string | null) {
         // Queue the prompt until both the WebView is mounted AND the page
@@ -135,25 +163,30 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     }
 
     // Re-inject cookies whenever the prop updates AFTER the WebView is already
-      // loaded. This handles the race where activeCookies resolves from async
-      // storage after the WebView has already fired its loadEnd event.
-      useEffect(() => {
-        if (!ready.current || !webRef.current || !cookies) return;
-        const cookieLines = cookies
-          .split(";")
-          .map((c) => c.trim())
-          .filter(Boolean)
-          .map((c) => `document.cookie = ${JSON.stringify(c + "; path=/;")};`)
-          .join("\n");
-        webRef.current.injectJavaScript(`(function(){try{${cookieLines}}catch(e){} })(); true;`);
-      }, [cookies]);
+    // loaded. This handles the race where activeCookies resolves from async
+    // storage after the WebView has already fired its loadEnd event.
+    useEffect(() => {
+      if (!ready.current || !webRef.current || !cookies) return;
+      const cookieLines = cookies
+        .split(";")
+        .map((c) => c.trim())
+        .filter(Boolean)
+        .map((c) => `document.cookie = ${JSON.stringify(c + "; path=/;")};`)
+        .join("\n");
+      webRef.current.injectJavaScript(`(function(){try{${cookieLines}}catch(e){} })(); true;`);
+    }, [cookies]);
 
-      return (
+    return (
       <View style={styles.container} pointerEvents={visible ? "auto" : "none"}>
         <WebView
           ref={(r) => {
             webRef.current = r;
           }}
+          // key changes when the active account changes, forcing a full remount
+          // so each account gets a completely isolated WKWebView context.
+          // Without this, switching accounts would reuse the same WebView
+          // instance and the previous account's session would persist.
+          key={webViewKey}
           source={{ uri: sourceUriRef.current }}
           injectedJavaScriptBeforeContentLoaded={loginObserverScript(provider)}
           onMessage={handleMessage}
