@@ -94,6 +94,13 @@ export default function AccountsScreen() {
               router.back();
             }}
             onRemove={() => confirmRemove(item.id, item.email)}
+            onRefreshSession={() => {
+              void Haptics.selectionAsync();
+              router.push({
+                pathname: "/login",
+                params: { providerId: item.providerId },
+              });
+            }}
           />
         )}
       />
