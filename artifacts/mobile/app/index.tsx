@@ -410,7 +410,7 @@ export default function ChatScreen() {
             ref={automationRef}
             sessionKey={activeAccount.id}
             provider={getResolvedProvider(activeAccount.providerId)}
-            cookies={activeCookies ?? ""}
+            cookies={activeCookies}
             onEvent={handleAutomationEvent}
             visible={liveView}
             resumeUrl={chatUrls[activeAccount.id] ?? null}
