@@ -121,6 +121,14 @@ export default function ChatScreen() {
         if (activeAccount) await markAccountStatus(activeAccount.id, "expired");
         return;
       }
+      if (e.type === "sessionValid") {
+        // When WebView successfully loads on a non-login page, restore the
+        // account status to "active" if it was previously marked as expired.
+        if (activeAccount && activeAccount.status === "expired") {
+          await markAccountStatus(activeAccount.id, "active");
+        }
+        return;
+      }
 
       if (e.type === "response" && id) {
         updateMessage(id, {
