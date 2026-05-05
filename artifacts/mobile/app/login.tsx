@@ -1,5 +1,4 @@
 import { Feather } from "@expo/vector-icons";
-import CookieManager from "@react-native-cookies/cookies";
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -12,178 +11,133 @@ import {
 } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import CookieManager from "@react-native-cookies/cookies";
 
 import { useApp } from "@/contexts/AppContext";
 import { useColors } from "@/hooks/useColors";
 import { PROVIDERS, type ProviderId } from "@/lib/providers";
 import { loginObserverScript } from "@/lib/webview-scripts";
 
-/** Returns true if the URL looks like a login / auth page. */
-function isAuthUrl(url: string): boolean {
-  const l = url.toLowerCase();
-  return (
-    l.includes('/login') ||
-    l.includes('/auth/login') ||
-    l.includes('/signin') ||
-    l.includes('/sign-in') ||
-    l.includes('/logout') ||
-    l.includes('accounts.google.com')
-  );
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type LoginPhase = "clearing" | "ready";
+
+interface DetectedSession {
+  email: string | null;
+  /** Raw document.cookie string — non-httpOnly cookies only. Fallback. */
+  docCookies: string;
 }
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 
 export default function LoginWebViewScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const { providerId } = useLocalSearchParams<{ providerId: ProviderId }>();
   const provider = providerId ? PROVIDERS[providerId] : null;
-
   const { addAccount } = useApp();
 
-  const [email, setEmail] = useState<string | null>(null);
-  const [detected, setDetected] = useState(false);
+  // Phase: first load logout URL to wipe any existing session, then switch to
+  // the real login URL. A ref guards against firing the transition more than
+  // once across redirect chains that may fire onLoadEnd multiple times.
+  const [phase, setPhase] = useState<LoginPhase>("clearing");
+  const clearingDoneRef = useRef(false);
+  const webRef = useRef<WebView | null>(null);
+
+  // Session data emitted by the injected JS observer.
+  const [session, setSession] = useState<DetectedSession | null>(null);
   const [saving, setSaving] = useState(false);
 
-  /**
-   * Two-phase load:
-   *   "logout" — navigate to logoutUrl so any prior session is cleared.
-   *   "login"  — load the actual login page in the shared cookie store.
-   *
-   * incognito={false} + sharedCookiesEnabled={true} ensures that after login
-   * CookieManager.getAll() can capture ALL cookies including httpOnly ones.
-   * Session isolation is achieved by the logout phase, not by incognito.
-   */
-  const [phase, setPhase] = useState<"logout" | "login">("logout");
-  const webRef = useRef<WebView | null>(null);
-  const logoutLoadedRef = useRef(false);
-  const detectedRef = useRef(false);
-
+  // Redirect away if provider is invalid.
   useEffect(() => {
     if (!provider) router.back();
   }, [provider]);
 
-  /**
-   * DETECTION STRATEGY 1 (backup) — JS / document.cookie via injected script.
-   * Works for non-httpOnly session cookies.
-   */
+  if (!provider) return null;
+
+  // -------------------------------------------------------------------------
+  // WebView message handler
+  // -------------------------------------------------------------------------
+
   function handleMessage(e: WebViewMessageEvent) {
     try {
-      const parsed = JSON.parse(e.nativeEvent.data) as {
+      const msg = JSON.parse(e.nativeEvent.data) as {
         type: string;
         payload?: { cookie?: string; email?: string };
       };
-      if (parsed.type === "profile" && parsed.payload?.email) {
-        setEmail(parsed.payload.email);
+
+      if (msg.type === "loginDetected") {
+        // loginDetected is the authoritative signal — set session if not yet set.
+        setSession((prev) => prev ?? { email: null, docCookies: "" });
       }
-      if (parsed.type === "loginDetected" && !detectedRef.current) {
-        detectedRef.current = true;
-        setDetected(true);
+
+      if (msg.type === "cookies" && msg.payload?.cookie) {
+        setSession((prev) =>
+          prev ? { ...prev, docCookies: msg.payload!.cookie! } : prev,
+        );
       }
-    } catch { /* ignore */ }
+
+      if (msg.type === "profile" && msg.payload?.email) {
+        setSession((prev) =>
+          prev ? { ...prev, email: msg.payload!.email! } : prev,
+        );
+      }
+    } catch {
+      // Malformed message — ignore.
+    }
   }
+
+  // -------------------------------------------------------------------------
+  // Phase transition: clearing → ready
+  // -------------------------------------------------------------------------
 
   function handleLoadEnd() {
-    if (phase === "logout" && !logoutLoadedRef.current) {
-      logoutLoadedRef.current = true;
-      setPhase("login");
+    if (phase === "clearing" && !clearingDoneRef.current) {
+      clearingDoneRef.current = true;
+      setPhase("ready");
     }
   }
 
-  /**
-   * DETECTION STRATEGY 2 (primary) — URL navigation.
-   * When the WebView leaves a login/auth URL and lands on the provider's
-   * domain (e.g. chatgpt.com/, claude.ai/new, gemini.google.com/app),
-   * the user is now logged in — even if session cookies are httpOnly and
-   * invisible to document.cookie.
-   */
-  function handleNavChange(navState: { url?: string }) {
-    if (phase !== "login" || detectedRef.current) return;
-    const url = navState.url ?? "";
-    if (!url || isAuthUrl(url)) return;
-    const providerDomain = provider?.cookieDomains.some((d) =>
-      url.toLowerCase().includes(d.replace(/^./, "")),
-    );
-    if (providerDomain) {
-      detectedRef.current = true;
-      setDetected(true);
-    }
-  }
-
-  /**
-   * DETECTION STRATEGY 3 (backup for httpOnly) — periodic CookieManager poll.
-   * Every 2 s during the login phase, check the OS cookie store for session
-   * keys. Catches httpOnly cookies that document.cookie cannot see and that
-   * URL-navigation may miss (e.g. SPAs that don't navigate post-login).
-   */
-  useEffect(() => {
-    if (phase !== "login" || detected || !provider) return;
-    const sessionKeys = new Set(provider.sessionCookieKeys);
-    const iv = setInterval(async () => {
-      if (detectedRef.current) { clearInterval(iv); return; }
-      try {
-        const all = await CookieManager.getAll();
-        const found = Object.keys(all).some((k) => sessionKeys.has(k));
-        if (found) {
-          clearInterval(iv);
-          detectedRef.current = true;
-          setDetected(true);
-        }
-      } catch { /* CookieManager unavailable */ }
-    }, 2000);
-    return () => clearInterval(iv);
-  }, [phase, detected, provider]);
+  // -------------------------------------------------------------------------
+  // Save session
+  // -------------------------------------------------------------------------
 
   async function handleSave() {
-    if (!detected || saving || !provider) return;
+    if (!session || saving) return;
     setSaving(true);
     try {
-      // Capture ALL cookies from the OS store — includes httpOnly session cookies
-      // that document.cookie cannot access. Stored as a JSON array with full
-      // metadata (domain, path, httpOnly, secure) so AutomationWebView can
-      // restore them precisely via CookieManager.set().
-      let cookiesToSave = "";
-      try {
-        const allCookies = await CookieManager.getAll();
-        const cookieArray = Object.values(allCookies);
-        if (cookieArray.length > 0) {
-          // Filter out obviously expired / empty cookies to keep size down.
-          const valid = cookieArray.filter(
-            (c) => c.value && c.value !== "deleted",
-          );
-          cookiesToSave = JSON.stringify(valid.length > 0 ? valid : cookieArray);
-        }
-      } catch {
-        // CookieManager unavailable — account won't be saveable; surface error.
-        throw new Error("Unable to capture session cookies. Please try again.");
-      }
-
-      if (!cookiesToSave) {
-        throw new Error("No cookies captured. Please complete the login first.");
-      }
-
+      const cookies = await captureCookies(session.docCookies);
       await addAccount({
         providerId: provider.id,
-        email: email ?? `${provider.id}@local`,
-        cookies: cookiesToSave,
+        email: session.email ?? `${provider.id}@local`,
+        cookies,
       });
       router.back();
-    } catch (err) {
-      // Re-set saving so user can retry
-      setSaving(false);
-      // Rethrow so a future error boundary or alert can surface it
-      throw err;
     } finally {
       setSaving(false);
     }
   }
 
-  const sourceUri = phase === "logout" ? provider?.logoutUrl ?? "" : provider?.loginUrl ?? "";
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
 
-  if (!provider) return null;
+  const sourceUri =
+    phase === "clearing" ? provider.logoutUrl : provider.loginUrl;
+  const isDetected = session !== null;
 
   return (
     <View
-      style={[styles.root, { backgroundColor: colors.background, paddingTop: insets.top }]}
+      style={[
+        styles.root,
+        { backgroundColor: colors.background, paddingTop: insets.top },
+      ]}
     >
+      {/* Header */}
       <View style={[styles.header, { borderBottomColor: colors.border }]}>
         <Pressable
           onPress={() => router.back()}
@@ -192,6 +146,7 @@ export default function LoginWebViewScreen() {
         >
           <Feather name="x" size={20} color={colors.foreground} />
         </Pressable>
+
         <View style={styles.headerCenter}>
           <Text style={[styles.title, { color: colors.foreground }]}>
             Sign in to {provider.name}
@@ -202,30 +157,31 @@ export default function LoginWebViewScreen() {
                 styles.statusDot,
                 {
                   backgroundColor:
-                    phase === "logout"
+                    phase === "clearing"
                       ? colors.textMuted
-                      : detected
-                      ? colors.success
-                      : colors.textMuted,
+                      : isDetected
+                        ? colors.success
+                        : colors.textMuted,
                 },
               ]}
             />
             <Text style={[styles.statusText, { color: colors.mutedForeground }]}>
-              {phase === "logout"
+              {phase === "clearing"
                 ? "Clearing previous session…"
-                : detected
-                ? "Session detected"
-                : "Waiting for login…"}
+                : isDetected
+                  ? "Session detected"
+                  : "Waiting for login…"}
             </Text>
           </View>
         </View>
+
         <Pressable
           onPress={handleSave}
-          disabled={!detected || saving}
+          disabled={!isDetected || saving}
           style={({ pressed }) => [
             styles.saveBtn,
             {
-              backgroundColor: detected ? colors.foreground : colors.raised,
+              backgroundColor: isDetected ? colors.foreground : colors.raised,
               opacity: pressed || saving ? 0.7 : 1,
             },
           ]}
@@ -234,7 +190,10 @@ export default function LoginWebViewScreen() {
             <ActivityIndicator size="small" color={colors.background} />
           ) : (
             <Text
-              style={[styles.saveBtnText, { color: detected ? colors.background : colors.textMuted }]}
+              style={[
+                styles.saveBtnText,
+                { color: isDetected ? colors.background : colors.textMuted },
+              ]}
             >
               Save
             </Text>
@@ -242,26 +201,38 @@ export default function LoginWebViewScreen() {
         </Pressable>
       </View>
 
+      {/* WebView */}
       <View style={styles.webWrap}>
         <WebView
           ref={(r) => { webRef.current = r; }}
+          // `key` forces a full remount when the phase changes so the new URL
+          // always gets a fresh navigation context.
           key={phase}
           source={{ uri: sourceUri }}
           injectedJavaScriptBeforeContentLoaded={
-            phase === "login" ? loginObserverScript(provider) : undefined
+            phase === "ready" ? loginObserverScript(provider) : undefined
           }
           onMessage={handleMessage}
           onLoadEnd={handleLoadEnd}
-          onNavigationStateChange={handleNavChange}
           javaScriptEnabled
           domStorageEnabled
           thirdPartyCookiesEnabled
+          // Keep the shared OS cookie store so CookieManager.getAll() can
+          // capture httpOnly session cookies after login. Session isolation
+          // is handled by the clearing phase (logout URL) above.
           incognito={false}
-          sharedCookiesEnabled={true}
-          cacheEnabled={false}
+          sharedCookiesEnabled
+          // Always fetch logout fresh so stale cache doesn't skip the clearing.
+          cacheEnabled={phase !== "clearing"}
           startInLoadingState
           renderLoading={() => (
-            <View style={[StyleSheet.absoluteFill, styles.loading, { backgroundColor: colors.background }]}>
+            <View
+              style={[
+                StyleSheet.absoluteFill,
+                styles.centred,
+                { backgroundColor: colors.background },
+              ]}
+            >
               <ActivityIndicator color={colors.foreground} />
             </View>
           )}
@@ -272,46 +243,88 @@ export default function LoginWebViewScreen() {
               : undefined
           }
         />
-        {phase === "logout" ? (
-          <View style={[StyleSheet.absoluteFill, styles.loading, { backgroundColor: colors.background }]}>
+
+        {/* Overlay while clearing the previous session */}
+        {phase === "clearing" && (
+          <View
+            style={[
+              StyleSheet.absoluteFill,
+              styles.centred,
+              { backgroundColor: colors.background },
+            ]}
+          >
             <ActivityIndicator color={colors.foreground} />
-            <Text style={[styles.loadingText, { color: colors.mutedForeground, marginTop: 12 }]}>
+            <Text
+              style={[
+                styles.loadingText,
+                { color: colors.mutedForeground, marginTop: 12 },
+              ]}
+            >
               Preparing a fresh login…
             </Text>
           </View>
-        ) : null}
+        )}
       </View>
 
-      {phase === "login" ? (
-        detected ? (
-          <View
-            style={[
-              styles.footerHint,
-              { borderTopColor: colors.border, backgroundColor: colors.elevated, paddingBottom: insets.bottom + 12 },
-            ]}
-          >
-            <Feather name="check-circle" size={16} color={colors.success} />
-            <Text style={[styles.footerText, { color: colors.foreground }]}>
-              Logged in{email ? ` as ${email}` : ""}. Tap Save to continue.
-            </Text>
-          </View>
-        ) : (
-          <View
-            style={[
-              styles.footerHint,
-              { borderTopColor: colors.border, backgroundColor: colors.elevated, paddingBottom: insets.bottom + 12 },
-            ]}
-          >
-            <Feather name="lock" size={14} color={colors.mutedForeground} />
-            <Text style={[styles.footerText, { color: colors.mutedForeground }]}>
-              Sign in with your existing {provider.name} account.
-            </Text>
-          </View>
-        )
-      ) : null}
+      {/* Footer hint */}
+      {phase === "ready" && (
+        <View
+          style={[
+            styles.footer,
+            {
+              borderTopColor: colors.border,
+              backgroundColor: colors.elevated,
+              paddingBottom: insets.bottom + 12,
+            },
+          ]}
+        >
+          {isDetected ? (
+            <>
+              <Feather name="check-circle" size={16} color={colors.success} />
+              <Text style={[styles.footerText, { color: colors.foreground }]}>
+                Logged in{session?.email ? ` as ${session.email}` : ""}. Tap Save to
+                continue.
+              </Text>
+            </>
+          ) : (
+            <>
+              <Feather name="lock" size={14} color={colors.mutedForeground} />
+              <Text style={[styles.footerText, { color: colors.mutedForeground }]}>
+                Sign in with your existing {provider.name} account.
+              </Text>
+            </>
+          )}
+        </View>
+      )}
     </View>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Captures the full cookie jar via CookieManager (includes httpOnly cookies
+ * that document.cookie cannot see). Falls back to the non-httpOnly string
+ * collected by the injected observer script when CookieManager is unavailable.
+ */
+async function captureCookies(docCookieFallback: string): Promise<string> {
+  try {
+    const all = await CookieManager.getAll();
+    const arr = Object.values(all);
+    if (arr.length > 0) {
+      return JSON.stringify(arr);
+    }
+  } catch {
+    // CookieManager not available in this environment — use fallback.
+  }
+  return docCookieFallback;
+}
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
@@ -331,10 +344,25 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   headerCenter: { flex: 1 },
-  title: { fontFamily: "Inter_700Bold", fontSize: 16 },
-  statusRow: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 },
-  statusDot: { width: 6, height: 6, borderRadius: 3 },
-  statusText: { fontFamily: "Inter_400Regular", fontSize: 12 },
+  title: {
+    fontFamily: "Inter_700Bold",
+    fontSize: 16,
+  },
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 2,
+  },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  statusText: {
+    fontFamily: "Inter_400Regular",
+    fontSize: 12,
+  },
   saveBtn: {
     paddingHorizontal: 14,
     paddingVertical: 8,
@@ -343,11 +371,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  saveBtnText: { fontFamily: "Inter_600SemiBold", fontSize: 14 },
+  saveBtnText: {
+    fontFamily: "Inter_600SemiBold",
+    fontSize: 14,
+  },
   webWrap: { flex: 1 },
-  loading: { alignItems: "center", justifyContent: "center" },
-  loadingText: { fontFamily: "Inter_400Regular", fontSize: 13 },
-  footerHint: {
+  centred: { alignItems: "center", justifyContent: "center" },
+  loadingText: {
+    fontFamily: "Inter_400Regular",
+    fontSize: 13,
+  },
+  footer: {
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
@@ -355,5 +389,9 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     borderTopWidth: StyleSheet.hairlineWidth,
   },
-  footerText: { fontFamily: "Inter_500Medium", fontSize: 13, flex: 1 },
+  footerText: {
+    fontFamily: "Inter_500Medium",
+    fontSize: 13,
+    flex: 1,
+  },
 });
