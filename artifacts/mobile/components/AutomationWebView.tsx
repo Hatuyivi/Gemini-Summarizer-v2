@@ -17,6 +17,15 @@ export interface AutomationHandle {
   send(prompt: string, imageDataUrl?: string | null): Promise<void>;
 }
 
+interface CookieEntry {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  secure?: boolean;
+  httpOnly?: boolean;
+}
+
 interface Props {
   provider: AIProvider;
   /**
@@ -26,10 +35,15 @@ interface Props {
    */
   sessionKey: string;
   /**
-   * Cookie string saved from login (document.cookie-style "name=value; name2=value2").
-   * null means cookies are still loading from SecureStore — the WebView will not
-   * mount until this resolves to a non-null value so it never fires its first
-   * request against the wrong (previous account's) OS cookie store.
+   * Cookies saved at login time. Two formats are supported:
+   *   - JSON string (new format): JSON.stringify(CookieEntry[]) — includes
+   *     httpOnly session cookies captured via CookieManager.getAll().
+   *   - Legacy string: "name=value; name2=value2" — document.cookie format,
+   *     non-httpOnly cookies only. Still accepted for backward compatibility
+   *     with accounts added before this fix.
+   * null means cookies are still loading from SecureStore — the WebView will
+   * not mount until this resolves to prevent firing the first request against
+   * the wrong (previous account's) OS cookie store.
    */
   cookies: string | null;
   onEvent: (e: AutomationEvent) => void;
@@ -43,6 +57,32 @@ interface Props {
    * Fires whenever the underlying WebView navigates to a new URL.
    */
   onUrlChange?: (url: string) => void;
+}
+
+/** Parse the stored cookie string into a list of CookieEntry objects. */
+function parseCookieString(raw: string): CookieEntry[] {
+  // New format: JSON array produced by CookieManager.getAll()
+  if (raw.trimStart().startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw) as CookieEntry[];
+      return parsed.filter((c) => c.name);
+    } catch {
+      // fall through to legacy parser
+    }
+  }
+  // Legacy format: "name=value; name2=value2" (document.cookie)
+  return raw
+    .split(";")
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .flatMap((pair) => {
+      const eqIdx = pair.indexOf("=");
+      if (eqIdx === -1) return [];
+      const name = pair.slice(0, eqIdx).trim();
+      const value = pair.slice(eqIdx + 1).trim();
+      if (!name) return [];
+      return [{ name, value }];
+    });
 }
 
 /** Hidden WebView that drives an authenticated AI service. */
@@ -94,17 +134,21 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
      *   JS-injection approach silently failed — the WebView always used the
      *   session of whichever account last completed a real WebView login.
      *
-     *   CookieManager.set() operates on the native WKHTTPCookieStore (iOS) /
+     *   CookieManager operates on the native WKHTTPCookieStore (iOS) /
      *   CookieManager (Android) that sharedCookiesEnabled WebViews read,
      *   bypassing the httpOnly restriction entirely.
+     *
+     *   Cookies are now captured at login time via CookieManager.getAll()
+     *   (in login.tsx), stored as a JSON array in SecureStore, and restored
+     *   here with full fidelity including domain, path, httpOnly, and secure.
      *
      * Flow:
      *   1. Gate the WebView (cookiesReady = false) so it cannot start loading.
      *   2. CookieManager.clearAll() — evict the previous account's httpOnly
      *      session cookies from the shared OS store.
      *   3. CookieManager.set() each saved cookie for the new account.
-     *   4. Ungate (cookiesReady = true) — the WebView mounts and fires its
-     *      first request with the correct cookies already in place.
+     *   4. Ungate (cookiesReady = true) — the WebView mounts with the correct
+     *      cookies already in place before the first network request fires.
      */
     useEffect(() => {
       if (cookies === null) {
@@ -119,26 +163,27 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
       (async () => {
         try {
           // Step 1: clear the shared OS store so no previous account's
-          // httpOnly session cookies can bleed into the new WebView session.
+          // httpOnly session cookies bleed into the new WebView session.
           await CookieManager.clearAll();
 
           if (!cancelled && cookies) {
-            // Step 2: install each saved cookie at the native layer.
-            const pairs = cookies
-              .split(";")
-              .map((c) => c.trim())
-              .filter(Boolean);
+            const entries = parseCookieString(cookies);
 
-            for (const pair of pairs) {
-              const eqIdx = pair.indexOf("=");
-              if (eqIdx === -1) continue;
-              const name = pair.slice(0, eqIdx).trim();
-              const value = pair.slice(eqIdx + 1).trim();
-              if (!name) continue;
-              await CookieManager.set(provider.chatUrl, {
-                name,
-                value,
-                path: "/",
+            for (const entry of entries) {
+              // Derive the URL to associate the cookie with. For cookies
+              // captured via CookieManager.getAll() the domain field is set;
+              // for legacy document.cookie strings we fall back to chatUrl.
+              const cookieUrl = entry.domain
+                ? `https://${entry.domain.replace(/^\./, "")}`
+                : provider.chatUrl;
+
+              await CookieManager.set(cookieUrl, {
+                name: entry.name,
+                value: entry.value,
+                domain: entry.domain,
+                path: entry.path ?? "/",
+                secure: entry.secure,
+                httpOnly: entry.httpOnly,
               });
             }
           }
@@ -233,7 +278,7 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
           Only render the WebView after CookieManager has cleared the shared OS
           store and installed the active account's cookies. This prevents the
           WebView from firing its first request before the correct session is
-          in place — which is the root cause of the account-switching bug.
+          in place — the root cause of the account-switching bug.
         */}
         {cookiesReady ? (
           <WebView
