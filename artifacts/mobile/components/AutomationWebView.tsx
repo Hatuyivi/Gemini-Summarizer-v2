@@ -1,4 +1,5 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import CookieManager from "@react-native-cookies/cookies";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { Platform, StyleSheet, View } from "react-native";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 
@@ -21,22 +22,25 @@ interface Props {
   /**
    * Stable per-device account id. MUST NOT depend on the cookie string:
    * cookies load async / can be re-serialized — using them in WebView `key`
-   * remounts the WebView and reloads `claude.ai/new` after every message.
+   * remounts the WebView and reloads the chat URL after every message.
    */
   sessionKey: string;
-  cookies: string;
+  /**
+   * Cookie string saved from login (document.cookie-style "name=value; name2=value2").
+   * null means cookies are still loading from SecureStore — the WebView will not
+   * mount until this resolves to a non-null value so it never fires its first
+   * request against the wrong (previous account's) OS cookie store.
+   */
+  cookies: string | null;
   onEvent: (e: AutomationEvent) => void;
   visible?: boolean;
   /**
    * If provided, the WebView resumes the previous chat at this URL instead
-   * of loading the provider's default chat URL (which would create a new
-   * chat). Used to keep the same conversation when the user navigates
-   * away from the chat screen and returns.
+   * of loading the provider's default chat URL (which would create a new chat).
    */
   resumeUrl?: string | null;
   /**
-   * Fires whenever the underlying WebView navigates to a new URL. The chat
-   * screen persists this so we can resume on remount.
+   * Fires whenever the underlying WebView navigates to a new URL.
    */
   onUrlChange?: (url: string) => void;
 }
@@ -54,36 +58,109 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     const sendQueue = useRef<{ prompt: string; image?: string | null }[]>([]);
     const ready = useRef(false);
 
-    // Remount WebView only when the logical session changes (account or
-    // provider) — never when the cookie *string* updates, or Claude reloads
-    // `…/new` and starts a fresh thread after every send on Android.
+    /**
+     * cookiesReady gates WebView mounting. It is false while we are clearing
+     * and re-installing OS-level cookies for the active account. The WebView
+     * must NOT fire its first network request until the correct session cookies
+     * are installed in the shared OS cookie store.
+     */
+    const [cookiesReady, setCookiesReady] = useState(false);
+
+    // Track session identity so we can detect account / provider switches.
     const prevProviderIdRef = useRef(provider.id);
     const prevSessionKeyRef = useRef(sessionKey);
     useEffect(() => {
-      const newProvId = provider.id;
       if (
-        newProvId !== prevProviderIdRef.current ||
+        provider.id !== prevProviderIdRef.current ||
         sessionKey !== prevSessionKeyRef.current
       ) {
-        prevProviderIdRef.current = newProvId;
+        prevProviderIdRef.current = provider.id;
         prevSessionKeyRef.current = sessionKey;
         ready.current = false;
         sendQueue.current = [];
         sourceUriRef.current = resumeUrl || provider.chatUrl;
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps -- resumeUrl/chatUrl
-      // are read intentionally only when sessionKey/provider.id change; adding
-      // resumeUrl would re-run on every Claude navigation and fight in-page URL.
+      // intentionally read only when session changes; adding resumeUrl would
+      // fight the in-page URL on every Claude navigation.
     }, [provider.id, sessionKey]);
+
+    /**
+     * Install this account's cookies at the OS level before the WebView loads.
+     *
+     * Why CookieManager instead of document.cookie injection:
+     *   Session cookies for Claude, Gemini, and ChatGPT are marked httpOnly.
+     *   document.cookie cannot read or write httpOnly cookies, so the previous
+     *   JS-injection approach silently failed — the WebView always used the
+     *   session of whichever account last completed a real WebView login.
+     *
+     *   CookieManager.set() operates on the native WKHTTPCookieStore (iOS) /
+     *   CookieManager (Android) that sharedCookiesEnabled WebViews read,
+     *   bypassing the httpOnly restriction entirely.
+     *
+     * Flow:
+     *   1. Gate the WebView (cookiesReady = false) so it cannot start loading.
+     *   2. CookieManager.clearAll() — evict the previous account's httpOnly
+     *      session cookies from the shared OS store.
+     *   3. CookieManager.set() each saved cookie for the new account.
+     *   4. Ungate (cookiesReady = true) — the WebView mounts and fires its
+     *      first request with the correct cookies already in place.
+     */
+    useEffect(() => {
+      if (cookies === null) {
+        // Cookies are still loading from SecureStore — keep WebView gated.
+        setCookiesReady(false);
+        return;
+      }
+
+      let cancelled = false;
+      setCookiesReady(false);
+
+      (async () => {
+        try {
+          // Step 1: clear the shared OS store so no previous account's
+          // httpOnly session cookies can bleed into the new WebView session.
+          await CookieManager.clearAll();
+
+          if (!cancelled && cookies) {
+            // Step 2: install each saved cookie at the native layer.
+            const pairs = cookies
+              .split(";")
+              .map((c) => c.trim())
+              .filter(Boolean);
+
+            for (const pair of pairs) {
+              const eqIdx = pair.indexOf("=");
+              if (eqIdx === -1) continue;
+              const name = pair.slice(0, eqIdx).trim();
+              const value = pair.slice(eqIdx + 1).trim();
+              if (!name) continue;
+              await CookieManager.set(provider.chatUrl, {
+                name,
+                value,
+                path: "/",
+              });
+            }
+          }
+        } catch {
+          // Cookie installation is best-effort; the WebView may recover via
+          // server-side session-refresh mechanisms.
+        }
+
+        if (!cancelled) {
+          setCookiesReady(true);
+        }
+      })();
+
+      return () => {
+        cancelled = true;
+      };
+    }, [sessionKey, provider.id, provider.chatUrl, cookies]);
 
     const webViewKey = `${provider.id}:${sessionKey}`;
 
     useImperativeHandle(ref, () => ({
       async send(prompt: string, imageDataUrl?: string | null) {
-        // Queue the prompt until both the WebView is mounted AND the page
-        // has finished its initial load. Otherwise injectJavaScript fires
-        // against a blank/loading document and the prompt is lost — this is
-        // exactly what happened during account rotation.
         if (!webRef.current || !ready.current) {
           sendQueue.current.push({ prompt, image: imageDataUrl });
           return;
@@ -140,21 +217,7 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     function handleLoadEnd() {
       if (!ready.current) {
         ready.current = true;
-        // Restore cookies via a small bootstrap (web view normally remembers
-        // them, but we re-inject just in case the page expects them inline).
-        if (cookies) {
-          const lines = cookies
-            .split(";")
-            .map((c) => c.trim())
-            .filter(Boolean)
-            .map(
-              (c) =>
-                `document.cookie = ${JSON.stringify(c + "; path=/")};`,
-            )
-            .join("\n");
-          webRef.current?.injectJavaScript(`(function(){try{${lines}}catch(e){} })(); true;`);
-        }
-        // process queued sends
+        // Flush any prompts queued while the page was loading.
         const queued = sendQueue.current.splice(0);
         queued.forEach((q) =>
           webRef.current?.injectJavaScript(
@@ -164,54 +227,50 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
       }
     }
 
-    // Re-inject cookies whenever the prop updates AFTER the WebView is already
-    // loaded. This handles the race where activeCookies resolves from async
-    // storage after the WebView has already fired its loadEnd event.
-    useEffect(() => {
-      if (!ready.current || !webRef.current || !cookies) return;
-      const cookieLines = cookies
-        .split(";")
-        .map((c) => c.trim())
-        .filter(Boolean)
-        .map((c) => `document.cookie = ${JSON.stringify(c + "; path=/;")};`)
-        .join("\n");
-      webRef.current.injectJavaScript(`(function(){try{${cookieLines}}catch(e){} })(); true;`);
-    }, [cookies]);
-
     return (
       <View style={styles.container} pointerEvents={visible ? "auto" : "none"}>
-        <WebView
-          ref={(r) => {
-            webRef.current = r;
-          }}
-          // key changes when the active account changes, forcing a full remount
-          // so each account gets a completely isolated WKWebView context.
-          // Without this, switching accounts would reuse the same WebView
-          // instance and the previous account's session would persist.
-          key={webViewKey}
-          source={{ uri: sourceUriRef.current }}
-          injectedJavaScriptBeforeContentLoaded={loginObserverScript(provider)}
-          onMessage={handleMessage}
-          onLoadEnd={handleLoadEnd}
-          onNavigationStateChange={(navState) => {
-            if (navState.url && onUrlChange) {
-              onUrlChange(navState.url);
+        {/*
+          Only render the WebView after CookieManager has cleared the shared OS
+          store and installed the active account's cookies. This prevents the
+          WebView from firing its first request before the correct session is
+          in place — which is the root cause of the account-switching bug.
+        */}
+        {cookiesReady ? (
+          <WebView
+            ref={(r) => {
+              webRef.current = r;
+            }}
+            // key changes when the active account changes, forcing a full
+            // remount so each account gets its own WebView lifecycle.
+            key={webViewKey}
+            source={{ uri: sourceUriRef.current }}
+            injectedJavaScriptBeforeContentLoaded={loginObserverScript(provider)}
+            onMessage={handleMessage}
+            onLoadEnd={handleLoadEnd}
+            onNavigationStateChange={(navState) => {
+              if (navState.url && onUrlChange) {
+                onUrlChange(navState.url);
+              }
+            }}
+            javaScriptEnabled
+            domStorageEnabled
+            thirdPartyCookiesEnabled
+            // Keep sharedCookiesEnabled so the WebView reads the OS cookie
+            // store where CookieManager installs the per-account cookies.
+            sharedCookiesEnabled={true}
+            cacheEnabled
+            // incognito must stay false — incognito WebViews use a separate
+            // ephemeral store that CookieManager cannot write to.
+            incognito={false}
+            startInLoadingState={false}
+            originWhitelist={["*"]}
+            userAgent={
+              Platform.OS === "android"
+                ? "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                : undefined
             }
-          }}
-          javaScriptEnabled
-          domStorageEnabled
-          thirdPartyCookiesEnabled
-          sharedCookiesEnabled
-          cacheEnabled
-          incognito={false}
-          startInLoadingState={false}
-          originWhitelist={["*"]}
-          userAgent={
-            Platform.OS === "android"
-              ? "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-              : undefined
-          }
-        />
+          />
+        ) : null}
       </View>
     );
   },
@@ -219,7 +278,7 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
 
 AutomationWebView.displayName = "AutomationWebView";
 
-// Attempt to silence unused import warning for type narrowing
+// Silence unused import warning for type narrowing
 void PROVIDERS;
 
 const styles = StyleSheet.create({
