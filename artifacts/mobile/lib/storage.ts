@@ -11,6 +11,10 @@ import type {
   SummaryBlock,
 } from "./types";
 
+// ---------------------------------------------------------------------------
+// Storage key registry
+// ---------------------------------------------------------------------------
+
 const KEYS = {
   ACCOUNTS: "mac_accounts_v1",
   ACTIVE_ACCOUNT: "mac_active_account_v1",
@@ -18,75 +22,104 @@ const KEYS = {
   SUMMARY: "mac_summary_v1",
   SELECTORS: "mac_selectors_v1",
   CHAT_URLS: "mac_chat_urls_v1",
+  /** Index of Gemini key metadata — no key material stored here. */
   GEMINI_KEYS_INDEX: "mac_gemini_keys_index_v1",
+  /** ID of the currently-selected Gemini key. */
   ACTIVE_GEMINI_KEY: "mac_active_gemini_key_v1",
+  /** History of viewable summary blocks. */
   SUMMARY_BLOCKS: "mac_summary_blocks_v1",
-};
+} as const;
 
-const COOKIE_PREFIX = "mac_ck_";
-const GEMINI_KEY_PREFIX = "mac_gemini_key_";
+const PREFIX_COOKIES = "mac_cookies_";
+const PREFIX_GEMINI_KEY = "mac_gemini_key_";
 
-/**
- * iOS SecureStore limit is ~2 048 bytes per value.
- * We chunk large cookie strings into 1 800-byte slices so even large
- * Google / Claude session payloads (5–20 KB) are stored reliably.
- *
- * Layout per account (accountId = "abc123"):
- *   mac_ck_abc123_n   → "3"          (chunk count)
- *   mac_ck_abc123_0   → first 1800 chars
- *   mac_ck_abc123_1   → next  1800 chars
- *   mac_ck_abc123_2   → remainder
- *
- * Legacy single-key format (mac_ck_abc123) is read as fallback so
- * old accounts still load until the user refreshes their session.
- */
-const CHUNK_SIZE = 1800;
+// ---------------------------------------------------------------------------
+// Secure storage primitives
+//
+// On native: SecureStore (Keychain / Keystore) with WHEN_UNLOCKED_THIS_DEVICE_ONLY.
+// On web: AsyncStorage (no native keychain available).
+// ---------------------------------------------------------------------------
 
 const isWeb = Platform.OS === "web";
 
-async function secureSet(key: string, value: string): Promise<void> {
-  if (isWeb) {
-    await AsyncStorage.setItem(key, value);
-    return;
+const secure = {
+  async set(key: string, value: string): Promise<void> {
+    if (isWeb) {
+      await AsyncStorage.setItem(key, value);
+      return;
+    }
+    await SecureStore.setItemAsync(key, value, {
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+    });
+  },
+
+  async get(key: string): Promise<string | null> {
+    if (isWeb) return AsyncStorage.getItem(key);
+    return SecureStore.getItemAsync(key);
+  },
+
+  async delete(key: string): Promise<void> {
+    if (isWeb) {
+      await AsyncStorage.removeItem(key);
+      return;
+    }
+    await SecureStore.deleteItemAsync(key);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// JSON helpers
+// ---------------------------------------------------------------------------
+
+async function readJSON<T>(key: string, fallback: T): Promise<T> {
+  try {
+    const raw = await AsyncStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
   }
-  await SecureStore.setItemAsync(key, value, {
-    keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-  });
 }
 
-async function secureGet(key: string): Promise<string | null> {
-  if (isWeb) return AsyncStorage.getItem(key);
-  return SecureStore.getItemAsync(key);
+async function writeJSON(key: string, value: unknown): Promise<void> {
+  await AsyncStorage.setItem(key, JSON.stringify(value));
 }
 
-async function secureDelete(key: string): Promise<void> {
-  if (isWeb) {
-    await AsyncStorage.removeItem(key);
-    return;
-  }
-  await SecureStore.deleteItemAsync(key);
-}
+// ---------------------------------------------------------------------------
+// Session (cookie) persistence
+//
+// Cookies are the only true credential in this app — they are stored
+// in SecureStore (Keychain) keyed by account ID so they never appear
+// in AsyncStorage or plain-text backups.
+// ---------------------------------------------------------------------------
 
-function chunkCountKey(accountId: string): string {
-  return `${COOKIE_PREFIX}${accountId}_n`;
-}
-function chunkKey(accountId: string, i: number): string {
-  return `${COOKIE_PREFIX}${accountId}_${i}`;
-}
-function legacyKey(accountId: string): string {
-  // Old format used a different prefix; kept for backward compat reads.
-  return `mac_cookies_${accountId}`;
-}
+export const sessionStorage = {
+  async save(accountId: string, cookies: string): Promise<void> {
+    await secure.set(`${PREFIX_COOKIES}${accountId}`, cookies);
+  },
+
+  async load(accountId: string): Promise<string | null> {
+    return secure.get(`${PREFIX_COOKIES}${accountId}`);
+  },
+
+  async remove(accountId: string): Promise<void> {
+    await secure.delete(`${PREFIX_COOKIES}${accountId}`);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Main storage API
+// ---------------------------------------------------------------------------
 
 export const storage = {
+  // ---- Accounts ------------------------------------------------------------
+
   async loadAccounts(): Promise<AIAccount[]> {
-    const raw = await AsyncStorage.getItem(KEYS.ACCOUNTS);
-    if (!raw) return [];
-    try { return JSON.parse(raw) as AIAccount[]; } catch { return []; }
+    return readJSON<AIAccount[]>(KEYS.ACCOUNTS, []);
   },
 
   async saveAccounts(accounts: AIAccount[]): Promise<void> {
-    await AsyncStorage.setItem(KEYS.ACCOUNTS, JSON.stringify(accounts));
+    await writeJSON(KEYS.ACCOUNTS, accounts);
   },
 
   async loadActiveAccountId(): Promise<string | null> {
@@ -94,145 +127,127 @@ export const storage = {
   },
 
   async saveActiveAccountId(id: string | null): Promise<void> {
-    if (id === null) await AsyncStorage.removeItem(KEYS.ACTIVE_ACCOUNT);
-    else await AsyncStorage.setItem(KEYS.ACTIVE_ACCOUNT, id);
+    if (id === null) {
+      await AsyncStorage.removeItem(KEYS.ACTIVE_ACCOUNT);
+    } else {
+      await AsyncStorage.setItem(KEYS.ACTIVE_ACCOUNT, id);
+    }
   },
 
+  // ---- Session cookies (delegates to sessionStorage) -----------------------
+
+  saveCookies: sessionStorage.save,
+  loadCookies: sessionStorage.load,
+  deleteCookies: sessionStorage.remove,
+
+  // ---- Messages ------------------------------------------------------------
+
   async loadMessages(): Promise<ChatMessage[]> {
-    const raw = await AsyncStorage.getItem(KEYS.MESSAGES);
-    if (!raw) return [];
-    try { return JSON.parse(raw) as ChatMessage[]; } catch { return []; }
+    return readJSON<ChatMessage[]>(KEYS.MESSAGES, []);
   },
 
   async saveMessages(messages: ChatMessage[]): Promise<void> {
-    await AsyncStorage.setItem(KEYS.MESSAGES, JSON.stringify(messages));
+    await writeJSON(KEYS.MESSAGES, messages);
   },
 
+  // ---- Conversation summary ------------------------------------------------
+
   async loadSummary(): Promise<ConversationSummary | null> {
-    const raw = await AsyncStorage.getItem(KEYS.SUMMARY);
-    if (!raw) return null;
-    try { return JSON.parse(raw) as ConversationSummary; } catch { return null; }
+    return readJSON<ConversationSummary | null>(KEYS.SUMMARY, null);
   },
 
   async saveSummary(s: ConversationSummary | null): Promise<void> {
-    if (!s) { await AsyncStorage.removeItem(KEYS.SUMMARY); return; }
-    await AsyncStorage.setItem(KEYS.SUMMARY, JSON.stringify(s));
+    if (!s) {
+      await AsyncStorage.removeItem(KEYS.SUMMARY);
+      return;
+    }
+    await writeJSON(KEYS.SUMMARY, s);
   },
 
-  /**
-   * Save cookies in chunks to bypass SecureStore's ~2 KB per-value limit.
-   * Overwrites any previous chunk set for this account.
-   */
-  async saveCookies(accountId: string, cookies: string): Promise<void> {
-    const chunks: string[] = [];
-    for (let i = 0; i < cookies.length; i += CHUNK_SIZE) {
-      chunks.push(cookies.slice(i, i + CHUNK_SIZE));
-    }
-    // Write count first so a partial write is detectable on read.
-    await secureSet(chunkCountKey(accountId), String(chunks.length));
-    for (let i = 0; i < chunks.length; i++) {
-      await secureSet(chunkKey(accountId, i), chunks[i]);
-    }
-  },
-
-  /**
-   * Read chunked cookies. Falls back to legacy single-key format for
-   * accounts added before this chunking was introduced.
-   */
-  async loadCookies(accountId: string): Promise<string | null> {
-    // Try new chunked format.
-    const nStr = await secureGet(chunkCountKey(accountId));
-    if (nStr !== null) {
-      const n = parseInt(nStr, 10);
-      if (!Number.isFinite(n) || n < 1) return null;
-      const parts: string[] = [];
-      for (let i = 0; i < n; i++) {
-        const chunk = await secureGet(chunkKey(accountId, i));
-        if (chunk === null) return null; // incomplete write
-        parts.push(chunk);
-      }
-      return parts.join("");
-    }
-    // Fallback: legacy single-key (old mac_cookies_ prefix).
-    return secureGet(legacyKey(accountId));
-  },
-
-  async deleteCookies(accountId: string): Promise<void> {
-    const nStr = await secureGet(chunkCountKey(accountId));
-    if (nStr !== null) {
-      const n = parseInt(nStr, 10);
-      await secureDelete(chunkCountKey(accountId));
-      for (let i = 0; i < n; i++) {
-        await secureDelete(chunkKey(accountId, i));
-      }
-    } else {
-      // Legacy key
-      await secureDelete(legacyKey(accountId));
-    }
-  },
+  // ---- Chat URLs (last visited URL per account) ----------------------------
 
   async loadChatUrls(): Promise<Record<string, string>> {
-    const raw = await AsyncStorage.getItem(KEYS.CHAT_URLS);
-    if (!raw) return {};
-    try { return JSON.parse(raw) as Record<string, string>; } catch { return {}; }
+    return readJSON<Record<string, string>>(KEYS.CHAT_URLS, {});
   },
 
   async saveChatUrls(map: Record<string, string>): Promise<void> {
-    await AsyncStorage.setItem(KEYS.CHAT_URLS, JSON.stringify(map));
+    await writeJSON(KEYS.CHAT_URLS, map);
   },
 
+  // ---- Provider selector overrides -----------------------------------------
+
   async loadSelectors(): Promise<ProviderSelectorOverrides> {
-    const raw = await AsyncStorage.getItem(KEYS.SELECTORS);
-    if (!raw) return {};
-    try { return JSON.parse(raw) as ProviderSelectorOverrides; } catch { return {}; }
+    return readJSON<ProviderSelectorOverrides>(KEYS.SELECTORS, {});
   },
 
   async saveSelectors(s: ProviderSelectorOverrides): Promise<void> {
-    await AsyncStorage.setItem(KEYS.SELECTORS, JSON.stringify(s));
+    await writeJSON(KEYS.SELECTORS, s);
   },
+
+  // ---- Gemini API keys -------------------------------------------------------
+  //
+  // Key metadata (id, label, addedAt, lastUsedAt) is stored in AsyncStorage as
+  // a plain JSON index. The actual secret key material lives in SecureStore.
+  // ---------------------------------------------------------------------------
 
   async loadGeminiKeys(): Promise<GeminiApiKey[]> {
-    const raw = await AsyncStorage.getItem(KEYS.GEMINI_KEYS_INDEX);
-    if (!raw) return [];
-    let index: Array<Omit<GeminiApiKey, "key">>;
-    try { index = JSON.parse(raw) as Array<Omit<GeminiApiKey, "key">>; }
-    catch { return []; }
-    const keys: GeminiApiKey[] = [];
+    const index = await readJSON<Array<Omit<GeminiApiKey, "key">>>(
+      KEYS.GEMINI_KEYS_INDEX,
+      [],
+    );
+    const results: GeminiApiKey[] = [];
     for (const meta of index) {
-      const k = await secureGet(`${GEMINI_KEY_PREFIX}${meta.id}`);
-      if (k) keys.push({ ...meta, key: k });
+      const key = await secure.get(`${PREFIX_GEMINI_KEY}${meta.id}`);
+      if (key) results.push({ ...meta, key });
     }
-    return keys;
+    return results;
   },
 
-  async saveGeminiKey(input: { id: string; label: string; key: string; addedAt?: number }): Promise<void> {
+  async saveGeminiKey(input: {
+    id: string;
+    label: string;
+    key: string;
+    addedAt?: number;
+  }): Promise<void> {
     const addedAt = input.addedAt ?? Date.now();
-    await secureSet(`${GEMINI_KEY_PREFIX}${input.id}`, input.key);
-    const raw = await AsyncStorage.getItem(KEYS.GEMINI_KEYS_INDEX);
-    let index: Array<Omit<GeminiApiKey, "key">> = [];
-    if (raw) { try { index = JSON.parse(raw) as Array<Omit<GeminiApiKey, "key">>; } catch { index = []; } }
-    const without = index.filter((k) => k.id !== input.id);
-    without.push({ id: input.id, label: input.label, addedAt });
-    await AsyncStorage.setItem(KEYS.GEMINI_KEYS_INDEX, JSON.stringify(without));
+    // Persist key material securely.
+    await secure.set(`${PREFIX_GEMINI_KEY}${input.id}`, input.key);
+    // Update metadata index — replace entry if it already exists.
+    const index = await readJSON<Array<Omit<GeminiApiKey, "key">>>(
+      KEYS.GEMINI_KEYS_INDEX,
+      [],
+    );
+    const withoutCurrent = index.filter((k) => k.id !== input.id);
+    withoutCurrent.push({ id: input.id, label: input.label, addedAt });
+    await writeJSON(KEYS.GEMINI_KEYS_INDEX, withoutCurrent);
   },
 
   async deleteGeminiKey(id: string): Promise<void> {
-    await secureDelete(`${GEMINI_KEY_PREFIX}${id}`);
-    const raw = await AsyncStorage.getItem(KEYS.GEMINI_KEYS_INDEX);
-    if (!raw) return;
-    let index: Array<Omit<GeminiApiKey, "key">> = [];
-    try { index = JSON.parse(raw) as Array<Omit<GeminiApiKey, "key">>; } catch { return; }
-    await AsyncStorage.setItem(KEYS.GEMINI_KEYS_INDEX, JSON.stringify(index.filter((k) => k.id !== id)));
+    await secure.delete(`${PREFIX_GEMINI_KEY}${id}`);
+    const index = await readJSON<Array<Omit<GeminiApiKey, "key">>>(
+      KEYS.GEMINI_KEYS_INDEX,
+      [],
+    );
+    await writeJSON(
+      KEYS.GEMINI_KEYS_INDEX,
+      index.filter((k) => k.id !== id),
+    );
+    // Clear the active-key pointer if it was pointing at this key.
     const active = await AsyncStorage.getItem(KEYS.ACTIVE_GEMINI_KEY);
-    if (active === id) await AsyncStorage.removeItem(KEYS.ACTIVE_GEMINI_KEY);
+    if (active === id) {
+      await AsyncStorage.removeItem(KEYS.ACTIVE_GEMINI_KEY);
+    }
   },
 
   async touchGeminiKey(id: string): Promise<void> {
-    const raw = await AsyncStorage.getItem(KEYS.GEMINI_KEYS_INDEX);
-    if (!raw) return;
-    let index: Array<Omit<GeminiApiKey, "key">> = [];
-    try { index = JSON.parse(raw) as Array<Omit<GeminiApiKey, "key">>; } catch { return; }
-    await AsyncStorage.setItem(KEYS.GEMINI_KEYS_INDEX, JSON.stringify(index.map((k) => k.id === id ? { ...k, lastUsedAt: Date.now() } : k)));
+    const index = await readJSON<Array<Omit<GeminiApiKey, "key">>>(
+      KEYS.GEMINI_KEYS_INDEX,
+      [],
+    );
+    await writeJSON(
+      KEYS.GEMINI_KEYS_INDEX,
+      index.map((k) => (k.id === id ? { ...k, lastUsedAt: Date.now() } : k)),
+    );
   },
 
   async loadActiveGeminiKeyId(): Promise<string | null> {
@@ -240,34 +255,55 @@ export const storage = {
   },
 
   async saveActiveGeminiKeyId(id: string | null): Promise<void> {
-    if (id === null) await AsyncStorage.removeItem(KEYS.ACTIVE_GEMINI_KEY);
-    else await AsyncStorage.setItem(KEYS.ACTIVE_GEMINI_KEY, id);
+    if (id === null) {
+      await AsyncStorage.removeItem(KEYS.ACTIVE_GEMINI_KEY);
+    } else {
+      await AsyncStorage.setItem(KEYS.ACTIVE_GEMINI_KEY, id);
+    }
   },
 
+  // ---- Summary blocks (compression history) --------------------------------
+
   async loadSummaryBlocks(): Promise<SummaryBlock[]> {
-    const raw = await AsyncStorage.getItem(KEYS.SUMMARY_BLOCKS);
-    if (!raw) return [];
-    try { return JSON.parse(raw) as SummaryBlock[]; } catch { return []; }
+    return readJSON<SummaryBlock[]>(KEYS.SUMMARY_BLOCKS, []);
   },
 
   async saveSummaryBlocks(blocks: SummaryBlock[]): Promise<void> {
-    await AsyncStorage.setItem(KEYS.SUMMARY_BLOCKS, JSON.stringify(blocks));
+    await writeJSON(KEYS.SUMMARY_BLOCKS, blocks);
   },
 
+  // ---- Nuclear reset -------------------------------------------------------
+
   async clearAll(): Promise<void> {
-    const accounts = await storage.loadAccounts();
-    const keys = await storage.loadGeminiKeys();
-    await Promise.all(accounts.map((a) => storage.deleteCookies(a.id)));
-    await Promise.all(keys.map((k) => secureDelete(`${GEMINI_KEY_PREFIX}${k.id}`)));
+    const [accounts, keys] = await Promise.all([
+      storage.loadAccounts(),
+      storage.loadGeminiKeys(),
+    ]);
+
+    await Promise.all([
+      ...accounts.map((a) => secure.delete(`${PREFIX_COOKIES}${a.id}`)),
+      ...keys.map((k) => secure.delete(`${PREFIX_GEMINI_KEY}${k.id}`)),
+    ]);
+
     await AsyncStorage.multiRemove([
-      KEYS.ACCOUNTS, KEYS.SELECTORS, KEYS.ACTIVE_ACCOUNT,
-      KEYS.MESSAGES, KEYS.SUMMARY, KEYS.CHAT_URLS,
-      KEYS.GEMINI_KEYS_INDEX, KEYS.ACTIVE_GEMINI_KEY, KEYS.SUMMARY_BLOCKS,
+      KEYS.ACCOUNTS,
+      KEYS.ACTIVE_ACCOUNT,
+      KEYS.MESSAGES,
+      KEYS.SUMMARY,
+      KEYS.SELECTORS,
+      KEYS.CHAT_URLS,
+      KEYS.GEMINI_KEYS_INDEX,
+      KEYS.ACTIVE_GEMINI_KEY,
+      KEYS.SUMMARY_BLOCKS,
     ]);
   },
 };
 
+// ---------------------------------------------------------------------------
+// ID generator
+// ---------------------------------------------------------------------------
+
 export function newId(): string {
-  const part = () => Math.random().toString(36).slice(2, 11);
-  return `${Date.now().toString(36)}_${part()}_${part()}`;
+  const rand = () => Math.random().toString(36).slice(2, 11);
+  return `${Date.now().toString(36)}_${rand()}_${rand()}`;
 }
