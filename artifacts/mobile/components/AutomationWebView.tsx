@@ -12,7 +12,8 @@ export type AutomationEvent =
   | { type: "limit"; reason: string; resetAtMs?: number | null }
   | { type: "stage"; stage: string }
   | { type: "log"; msg: string }
-  | { type: "sessionExpired" };
+  | { type: "sessionExpired" }
+  | { type: "sessionValid" };
 
 export interface AutomationHandle {
   send(prompt: string, imageDataUrl?: string | null): Promise<void>;
@@ -31,7 +32,7 @@ interface Props {
   provider: AIProvider;
   sessionKey: string;
   /**
-   * Cookies saved at login time. Two formats supported:
+   * Cookies saved at login time. Two formats:
    *   - JSON string: JSON.stringify(CookieEntry[]) — includes httpOnly cookies.
    *   - Legacy "name=value; name2=value2" — backward-compat.
    * null = still loading from SecureStore; WebView will not mount yet.
@@ -48,7 +49,7 @@ function isLoginPageUrl(url: string): boolean {
   const lower = url.toLowerCase();
   const loginPatterns = [
     '/login', '/auth/login', '/signin', '/sign-in',
-    '/auth?', 'auth/login', 'accounts.google.com',
+    'auth?', 'accounts.google.com',
   ];
   return loginPatterns.some((p) => lower.includes(p));
 }
@@ -58,7 +59,7 @@ function parseCookieString(raw: string): CookieEntry[] {
   if (raw.trimStart().startsWith("[")) {
     try {
       const parsed = JSON.parse(raw) as CookieEntry[];
-      return parsed.filter((c) => c.name);
+      return parsed.filter((c) => c.name && c.value && c.value !== "deleted");
     } catch {
       // fall through
     }
@@ -77,7 +78,6 @@ function parseCookieString(raw: string): CookieEntry[] {
     });
 }
 
-/** Hidden WebView that drives an authenticated AI service. */
 export const AutomationWebView = forwardRef<AutomationHandle, Props>(
   function AutomationWebView(
     { provider, sessionKey, cookies, onEvent, visible, resumeUrl, onUrlChange },
@@ -87,16 +87,10 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     const webRef = useRef<WebView | null>(null);
     const sendQueue = useRef<{ prompt: string; image?: string | null }[]>([]);
     const ready = useRef(false);
-    /** Tracks the URL the WebView is currently on, updated by onNavigationStateChange. */
     const currentUrlRef = useRef<string>("");
-    /** True once sessionExpired has been emitted for this session, so we don't fire twice. */
-    const sessionExpiredFiredRef = useRef(false);
+    /** Prevent duplicate sessionExpired / sessionValid events per session. */
+    const sessionEventFiredRef = useRef<"expired" | "valid" | null>(null);
 
-    /**
-     * cookiesReady gates WebView mounting. False while clearing + installing
-     * OS-level cookies so the WebView never fires its first request against
-     * the wrong account's cookie store.
-     */
     const [cookiesReady, setCookiesReady] = useState(false);
 
     const prevProviderIdRef = useRef(provider.id);
@@ -110,17 +104,13 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
         prevSessionKeyRef.current = sessionKey;
         ready.current = false;
         sendQueue.current = [];
-        sessionExpiredFiredRef.current = false;
+        sessionEventFiredRef.current = null;
         sourceUriRef.current = resumeUrl || provider.chatUrl;
       }
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [provider.id, sessionKey]);
 
-    /**
-     * Install this account's cookies at the OS level before the WebView loads.
-     * Uses CookieManager (native layer) instead of document.cookie so httpOnly
-     * session cookies are properly installed/cleared on account switch.
-     */
+    /** Clear OS cookie store then install this account's saved cookies. */
     useEffect(() => {
       if (cookies === null) {
         setCookiesReady(false);
@@ -129,7 +119,7 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
 
       let cancelled = false;
       setCookiesReady(false);
-      sessionExpiredFiredRef.current = false;
+      sessionEventFiredRef.current = null;
 
       (async () => {
         try {
@@ -152,7 +142,7 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
             }
           }
         } catch {
-          // Best-effort; WebView may still recover via server-side session refresh.
+          // Best-effort; WebView may recover via server-side session refresh.
         }
 
         if (!cancelled) setCookiesReady(true);
@@ -209,15 +199,21 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
     function handleLoadEnd() {
       if (!ready.current) {
         ready.current = true;
-        // Check if the initial load already landed on a login page —
-        // this means the session is invalid (clearAll removed the cookies
-        // and the stored cookies were not sufficient to restore it).
         const url = currentUrlRef.current;
-        if (url && isLoginPageUrl(url) && !sessionExpiredFiredRef.current) {
-          sessionExpiredFiredRef.current = true;
-          onEvent({ type: "sessionExpired" });
-          return; // don't flush send queue against a login page
+        if (url && isLoginPageUrl(url)) {
+          // Initial load landed on a login page → session is invalid.
+          if (sessionEventFiredRef.current === null) {
+            sessionEventFiredRef.current = "expired";
+            onEvent({ type: "sessionExpired" });
+          }
+          return; // don't flush queue against a login page
         }
+        // Initial load landed on a normal page → session is valid.
+        if (sessionEventFiredRef.current === null) {
+          sessionEventFiredRef.current = "valid";
+          onEvent({ type: "sessionValid" });
+        }
+        // Flush any queued sends.
         const queued = sendQueue.current.splice(0);
         queued.forEach((q) =>
           webRef.current?.injectJavaScript(automationScript(q.prompt, provider, q.image)),
@@ -230,9 +226,9 @@ export const AutomationWebView = forwardRef<AutomationHandle, Props>(
       if (!url) return;
       currentUrlRef.current = url;
       if (onUrlChange) onUrlChange(url);
-      // After the first load, detect mid-session redirects to login pages.
-      if (ready.current && isLoginPageUrl(url) && !sessionExpiredFiredRef.current) {
-        sessionExpiredFiredRef.current = true;
+      // After first load: detect mid-session redirect to login.
+      if (ready.current && isLoginPageUrl(url) && sessionEventFiredRef.current !== "expired") {
+        sessionEventFiredRef.current = "expired";
         onEvent({ type: "sessionExpired" });
       }
     }
