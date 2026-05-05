@@ -15,6 +15,7 @@ import { Feather } from "@expo/vector-icons";
   import { useApp } from "@/contexts/AppContext";
   import { useColors } from "@/hooks/useColors";
   import { PROVIDERS, type ProviderId } from "@/lib/providers";
+  import CookieManager from "@react-native-cookies/cookies";
   import { loginObserverScript } from "@/lib/webview-scripts";
 
   export default function LoginWebViewScreen() {
@@ -87,13 +88,28 @@ import { Feather } from "@expo/vector-icons";
     }
 
     async function handleSave() {
-      if (!cookies || saving || !provider) return;
+      if (!detected || saving || !provider) return;
       setSaving(true);
       try {
+        // Capture ALL cookies from the OS store via CookieManager — this
+        // includes httpOnly session cookies that document.cookie cannot access.
+        // Stored as a JSON array so AutomationWebView can restore them with
+        // full fidelity (domain, path, httpOnly, secure) via CookieManager.set().
+        let cookiesToSave = cookies; // fallback: legacy document.cookie string
+        try {
+          const allCookies = await CookieManager.getAll();
+          const cookieArray = Object.values(allCookies);
+          if (cookieArray.length > 0) {
+            cookiesToSave = JSON.stringify(cookieArray);
+          }
+        } catch {
+          // CookieManager unavailable — fall back to the document.cookie string
+          // captured by loginObserverScript (non-httpOnly cookies only).
+        }
         await addAccount({
           providerId: provider.id,
           email: email ?? `${provider.id}@local`,
-          cookies,
+          cookies: cookiesToSave,
         });
         router.back();
       } finally {
@@ -193,14 +209,14 @@ import { Feather } from "@expo/vector-icons";
             javaScriptEnabled
             domStorageEnabled
             thirdPartyCookiesEnabled
-            // CRITICAL FIX: incognito=true gives this WebView its own isolated
-            // cookie/storage context. Without this, iOS shares the WKWebView
-            // data store across ALL WebView instances in the app — the active
-            // AutomationWebView session leaks in and the user sees the already-
-            // logged-in account instead of a fresh login form.
-            incognito={true}
-            // sharedCookiesEnabled is mutually exclusive with incognito on iOS.
-            sharedCookiesEnabled={false}
+            // Use the shared OS cookie store (incognito=false) so that after
+            // login completes, CookieManager.getAll() can capture ALL cookies
+            // including httpOnly session cookies that document.cookie cannot see.
+            // Session isolation for the login form is achieved by navigating to
+            // the provider's logoutUrl first (the "logout" phase above), which
+            // clears the previous session before the login page loads.
+            incognito={false}
+            sharedCookiesEnabled={true}
             // Disable cache so the logout page is always fetched fresh.
             cacheEnabled={false}
             startInLoadingState
