@@ -16,6 +16,7 @@ interface Props {
   isActive: boolean;
   onSelect: () => void;
   onRemove: () => void;
+  onRefreshSession?: () => void;
 }
 
 function formatRelative(ts: number): string {
@@ -54,7 +55,7 @@ function useCountdown(target: number | undefined): string | null {
   return formatCountdown(target - now);
 }
 
-export function AccountCard({ account, isActive, onSelect, onRemove }: Props) {
+export function AccountCard({ account, isActive, onSelect, onRemove, onRefreshSession }: Props) {
   const colors = useColors();
   const provider = PROVIDERS[account.providerId];
   const usagePct = Math.min(
@@ -186,6 +187,28 @@ export function AccountCard({ account, isActive, onSelect, onRemove }: Props) {
           </Text>
         </View>
       ) : null}
+
+      {account.status === "expired" && onRefreshSession ? (
+        <Pressable
+          onPress={(e) => {
+            e.stopPropagation();
+            onRefreshSession();
+          }}
+          style={({ pressed }) => [
+            styles.refreshBtn,
+            {
+              backgroundColor: colors.raised,
+              borderColor: colors.destructive + "55",
+              opacity: pressed ? 0.75 : 1,
+            },
+          ]}
+        >
+          <Feather name="refresh-cw" size={13} color={colors.destructive} />
+          <Text style={[styles.refreshBtnText, { color: colors.destructive }]}>
+            Refresh session
+          </Text>
+        </Pressable>
+      ) : null}
     </Pressable>
   );
 }
@@ -299,5 +322,18 @@ const styles = StyleSheet.create({
     fontSize: 11,
     letterSpacing: 0.4,
     textTransform: "uppercase",
+  },
+  refreshBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 9,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  refreshBtnText: {
+    fontFamily: "Inter_600SemiBold",
+    fontSize: 13,
   },
 });
