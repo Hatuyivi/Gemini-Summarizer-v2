@@ -117,6 +117,10 @@ export default function ChatScreen() {
       const id = pendingAssistantId.current;
       if (e.type === "stage") return;
       if (e.type === "log") return;
+      if (e.type === "sessionExpired") {
+        if (activeAccount) await markAccountStatus(activeAccount.id, "expired");
+        return;
+      }
 
       if (e.type === "response" && id) {
         updateMessage(id, {
@@ -521,6 +525,27 @@ export default function ChatScreen() {
           <Feather name="more-horizontal" size={20} color={colors.foreground} />
         </Pressable>
       </View>
+      {/* Expired session banner — shown when the WebView detects a login redirect */}
+      {activeAccount?.status === "expired" ? (
+        <Pressable
+          onPress={() =>
+            router.push({
+              pathname: "/login",
+              params: { providerId: activeAccount.providerId },
+            })
+          }
+          style={({ pressed }) => [
+            styles.expiredBanner,
+            { borderBottomColor: colors.border, opacity: pressed ? 0.8 : 1 },
+          ]}
+        >
+          <Feather name="alert-circle" size={14} color={colors.destructive} />
+          <Text style={[styles.expiredBannerText, { color: colors.destructive }]}>
+            Session expired — tap to refresh
+          </Text>
+          <Feather name="refresh-cw" size={14} color={colors.destructive} />
+        </Pressable>
+      ) : null}
       {handoffDebug ? (
         <View style={[styles.handoffDebugWrap, { borderBottomColor: colors.border }]}>
           <Text style={[styles.handoffDebugText, { color: colors.mutedForeground }]}>
@@ -858,6 +883,19 @@ const styles = StyleSheet.create({
   addInlineText: {
     fontFamily: "Inter_500Medium",
     fontSize: 12,
+  },
+  expiredBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  expiredBannerText: {
+    flex: 1,
+    fontFamily: "Inter_500Medium",
+    fontSize: 13,
   },
   empty: {
     flex: 1,
